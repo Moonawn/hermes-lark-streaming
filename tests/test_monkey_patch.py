@@ -110,6 +110,36 @@ class TestCronDeliveryWrapper:
 class TestMsgCtxCleanup:
     """Verify _msg_ctx is cleared after message processing to prevent leakage."""
 
+    @pytest.mark.asyncio
+    async def test_non_feishu_message_bypasses_streaming_hooks(self) -> None:
+        """A2A and other platforms must never create Feishu card sessions."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from hermes_lark_streaming.patching import (
+            _msg_ctx,
+            _started_msg_ids,
+            _wrap_handle_message_with_agent,
+        )
+
+        orig = AsyncMock(return_value={"final_response": "A2A_OK"})
+        wrapper = _wrap_handle_message_with_agent(orig)
+        runner = MagicMock()
+        event = SimpleNamespace(message_id="task-a2a-probe")
+        source = SimpleNamespace(
+            platform=SimpleNamespace(value="a2a"),
+            chat_id="a2a-context",
+        )
+
+        with patch("hermes_lark_streaming.patching.hooks.on_message_started") as started:
+            result = await wrapper(runner, event, source)
+
+        assert result == {"final_response": "A2A_OK"}
+        orig.assert_awaited_once_with(runner, event, source)
+        started.assert_not_called()
+        assert _msg_ctx.get() is None
+        assert event.message_id not in _started_msg_ids
+
     def test_msg_ctx_cleared_after_wrap_handle_message(self) -> None:
         """After _wrap_handle_message_with_agent completes, _msg_ctx should be None."""
         from hermes_lark_streaming.patching import _msg_ctx

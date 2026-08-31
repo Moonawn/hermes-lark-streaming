@@ -49,11 +49,7 @@ class HermesCompat:
         self.run_agent_module: Any | None = None
         
         # GatewayRunner
-        try:
-            from gateway.run import GatewayRunner
-            self.gateway_runner_class = GatewayRunner
-        except (ImportError, AttributeError):
-            _logger.debug("HLS: GatewayRunner not available yet")
+        self.gateway_runner_class = self._resolve_gateway_runner()
         
         # AIAgent
         try:
@@ -79,6 +75,24 @@ class HermesCompat:
         
         # Conversation loop (with namespace collision workaround)
         self._resolve_conversation_loop()
+
+    def _resolve_gateway_runner(self) -> Any | None:
+        """Resolve GatewayRunner without importing a partially-loaded module.
+
+        Hermes 0.20.3 discovers plugins on a background thread while the main
+        thread imports ``gateway.run``. Importing that module from plugin
+        registration can deadlock: the main thread waits for discovery, while
+        discovery waits for the module import lock. The existing delayed patch
+        poll will resolve the class after ``gateway.run`` finishes loading.
+        """
+        mod = sys.modules.get("gateway.run")
+        if mod is None:
+            _logger.debug("HLS: gateway.run not loaded yet; deferring GatewayRunner patch")
+            return None
+        cls = getattr(mod, "GatewayRunner", None)
+        if cls is None:
+            _logger.debug("HLS: gateway.run still initializing; deferring GatewayRunner patch")
+        return cls
     
     def _resolve_feishu_adapter(self) -> Any | None:
         """Resolve FeishuAdapter class through the gateway's namespace."""

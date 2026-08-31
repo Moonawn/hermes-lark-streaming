@@ -48,6 +48,9 @@ class _DummyFlush:
     def mark_completed(self) -> None:
         self.completed = True
 
+    def abort_pending(self) -> None:
+        self.completed = True
+
 
 @pytest.mark.parametrize("message_id", [None, ""])
 def test_on_message_started_ignores_missing_message_id(message_id: str | None) -> None:
@@ -74,6 +77,80 @@ def test_on_message_started_registers_anchor_alias_and_cleanup() -> None:
 
     assert "msg" not in ctrl._sessions
     assert "quoted" not in ctrl._sessions
+
+
+def test_cleanup_preserves_route_to_active_continuation() -> None:
+    ctrl = _setup_ctrl(linear=True)
+    old_session = _make_session("old", linear=True)
+    old_session.state = COMPLETED
+    continuation = _make_session("continuation", linear=True)
+    continuation.state = STREAMING
+    ctrl._sessions["old"] = old_session
+    ctrl._sessions["continuation"] = continuation
+    ctrl._register_continuation("old", "continuation")
+
+    ctrl._cleanup("old")
+
+    assert "old" not in ctrl._sessions
+    assert ctrl._resolve_continuation_id("old") == "continuation"
+
+
+def test_cleanup_then_on_completed_closes_continuation_and_rejects_late_output() -> None:
+    ctrl = _setup_ctrl(linear=True)
+    old_session = _make_session("old", linear=True)
+    old_session.state = COMPLETED
+    continuation = _make_session("continuation", linear=True)
+    continuation.state = STREAMING
+    continuation.unified_state.on_answer_delta("partial")
+    ctrl._sessions["old"] = old_session
+    ctrl._sessions["continuation"] = continuation
+    ctrl._register_continuation("old", "continuation")
+
+    ctrl._cleanup("old")
+    with patch.object(ctrl, "_complete_session") as complete_session:
+        assert ctrl.on_completed(message_id="old", answer="partial final")
+
+    assert continuation.state == COMPLETING
+    assert continuation.unified_state.answer_text == "partial final"
+    assert ctrl._resolve_continuation_id("old") is None
+    complete_session.assert_called_once_with(continuation)
+
+    ctrl.on_answer(message_id="old", text=" late review")
+    sent: list[str] = []
+    assert not ctrl.defer_background_review(
+        message_id="old", text="background review", sender=sent.append
+    )
+    assert continuation.unified_state.answer_text == "partial final"
+    assert sent == []
+
+
+def test_reply_anchor_continuation_is_completed_via_inbound_message_id() -> None:
+    """Callbacks may stream with anchor_id while completion uses inbound ID."""
+    ctrl = _setup_ctrl(linear=True)
+    old_session = _make_session("inbound", linear=True)
+    old_session.anchor_id = "quoted"
+    old_session.state = COMPLETED
+    continuation = _make_session("quoted-cont-1", linear=True)
+    continuation.state = STREAMING
+    continuation.unified_state.on_answer_delta("partial")
+    ctrl._sessions["inbound"] = old_session
+    ctrl._sessions["quoted"] = old_session
+    ctrl._sessions["quoted-cont-1"] = continuation
+
+    # The first post-tool token is keyed by the quoted/anchor ID.
+    ctrl._register_continuation("quoted", "quoted-cont-1")
+    assert ctrl._resolve_continuation_id("quoted") == "quoted-cont-1"
+    assert ctrl._resolve_continuation_id("inbound") == "quoted-cont-1"
+
+    # Hermes completes the turn with the inbound message ID.
+    with patch.object(ctrl, "_complete_session") as complete_session:
+        assert ctrl.on_completed(message_id="inbound", answer="partial final")
+
+    assert continuation.state == COMPLETING
+    assert continuation.unified_state.answer_text == "partial final"
+    assert ctrl._resolve_continuation_id("quoted") is None
+    assert ctrl._resolve_continuation_id("inbound") is None
+    complete_session.assert_called_once_with(continuation)
 
 
 def test_on_interrupted_uses_new_message_id_and_anchor_alias() -> None:
@@ -207,6 +284,8 @@ def test_prune_stale_sessions_ignores_none_key_and_prunes_valid_key() -> None:
         created_at=time.time() - ctrl._session_ttl - 1,
         flush=_DummyFlush(),
         is_terminal_phase=True,
+        state=COMPLETED,
+        writer=MagicMock(),
     )
     ctrl._sessions[None] = stale_session  # type: ignore[index,assignment]
     ctrl._sessions["msg"] = valid_stale_session  # type: ignore[assignment]
@@ -1445,6 +1524,7 @@ def test_prune_skips_streaming_session() -> None:
         created_at=time.time() - ctrl._session_ttl - 1,
         flush=_DummyFlush(),
         is_terminal_phase=False,  # STREAMING 不是终态
+        state=STREAMING,
     )
     ctrl._sessions["active"] = active_session  # type: ignore[assignment]
 
@@ -1464,6 +1544,8 @@ def test_prune_cleans_terminal_session() -> None:
         created_at=time.time() - ctrl._session_ttl - 1,
         flush=_DummyFlush(),
         is_terminal_phase=True,  # COMPLETED 是终态
+        state=COMPLETED,
+        writer=MagicMock(),
     )
     ctrl._sessions["done"] = terminal_session  # type: ignore[assignment]
 

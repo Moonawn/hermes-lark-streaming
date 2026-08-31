@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import sys
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -50,6 +51,7 @@ __all__ = [
     # From gateway
     '_wrap_handle_message',
     '_wrap_handle_message_with_agent',
+    '_wrap_deliver_queued_first_response',
     '_wrap_run_agent',
     '_wrap_run_background_task',
     '_wrap_cron_deliver',
@@ -57,8 +59,11 @@ __all__ = [
     # From callbacks
     '_maybe_wrap_callbacks',
     # From adapter
+    '_wrap_feishu_adapter_dispatch_inbound',
     '_classify_gateway_message',
     '_wrap_feishu_adapter_send',
+    '_wrap_feishu_adapter_fetch_message_text',
+    '_register_card_reply_context',
     '_register_gateway_card',
     '_unregister_gateway_card',
     '_wrap_feishu_adapter_edit',
@@ -114,6 +119,30 @@ _patch_status: dict[str, Any] = {}
 
 _patched_feishu_classes: set[int] = set()
 
+_patch_apply_lock = threading.RLock()
+
+
+def _gateway_runner_ready() -> bool:
+    """Return true only after ``gateway.run`` finished defining its runner."""
+    module = sys.modules.get("gateway.run")
+    return module is not None and getattr(module, "GatewayRunner", None) is not None
+
+
+def _defer_patches_until_gateway_ready() -> None:
+    """Apply patches after a concurrent ``gateway.run`` import completes."""
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        if _gateway_runner_ready():
+            with _patch_apply_lock:
+                apply_patches._deferred = False  # type: ignore[attr-defined]
+            apply_patches()
+            return
+        time.sleep(0.05)
+    _logger.error(
+        "hermes-lark-streaming: gateway.run did not become ready within 60s; "
+        "runtime patches were not applied"
+    )
+
 # When both the module-level patch and the direct AIAgent patch are active,
 # The guard prevents the second call from injecting the prefix again.
 
@@ -147,6 +176,7 @@ def _send_result_ok(message_id: str | None = None):
 from .gateway import (  # noqa: E402
     _wrap_handle_message,
     _wrap_handle_message_with_agent,
+    _wrap_deliver_queued_first_response,
     _wrap_run_agent,
     _wrap_run_background_task,
     _wrap_cron_deliver,
@@ -156,8 +186,16 @@ from .callbacks import (  # noqa: E402
     _maybe_wrap_callbacks,
 )
 from .adapter import (  # noqa: E402
+    _wrap_feishu_adapter_dispatch_inbound,
     _classify_gateway_message,
     _wrap_feishu_adapter_send,
+    _wrap_feishu_native_send_retry,
+    _wrap_feishu_delivery_retry,
+    _wrap_feishu_delivery_process,
+    _wrap_feishu_delivery_connect,
+    _wrap_feishu_delivery_disconnect,
+    _wrap_feishu_adapter_fetch_message_text,
+    _register_card_reply_context,
     _register_gateway_card,
     _unregister_gateway_card,
     _wrap_feishu_adapter_edit,
@@ -222,6 +260,17 @@ def _apply_gateway_runner_patches() -> bool:
         else:
             _logger.warning("hermes-lark-streaming: GatewayRunner._handle_message_with_agent not found, skipping patch")
 
+        if hasattr(GatewayRunner, '_deliver_queued_first_response'):
+            GatewayRunner._deliver_queued_first_response = _wrap_deliver_queued_first_response(
+                GatewayRunner._deliver_queued_first_response
+            )
+            _patched_methods.append('_deliver_queued_first_response')
+        else:
+            _logger.warning(
+                "hermes-lark-streaming: GatewayRunner._deliver_queued_first_response "
+                "not found, queued-turn pre-seal patch skipped"
+            )
+
         if hasattr(GatewayRunner, '_run_agent'):
             GatewayRunner._run_agent = _wrap_run_agent(GatewayRunner._run_agent)
             _patched_methods.append('_run_agent')
@@ -259,9 +308,23 @@ def _apply_gateway_runner_patches() -> bool:
 
 def apply_patches() -> None:
     """Apply all runtime monkey patches to ``GatewayRunner`` and ``AIAgent``."""
-    if getattr(apply_patches, "_applied", False):
-        return
-    apply_patches._applied = True  # type: ignore[attr-defined]
+    with _patch_apply_lock:
+        if getattr(apply_patches, "_applied", False):
+            return
+        if not _gateway_runner_ready():
+            if not getattr(apply_patches, "_deferred", False):
+                apply_patches._deferred = True  # type: ignore[attr-defined]
+                _logger.info(
+                    "hermes-lark-streaming: gateway.run is still initializing; "
+                    "deferring runtime patches"
+                )
+                threading.Thread(
+                    target=_defer_patches_until_gateway_ready,
+                    name="hermes-lark-streaming-deferred-patch",
+                    daemon=True,
+                ).start()
+            return
+        apply_patches._applied = True  # type: ignore[attr-defined]
 
     _logger.info("hermes-lark-streaming v%s: apply_patches() starting", __version__)
 
@@ -431,7 +494,37 @@ def _apply_feishu_adapter_patches(FeishuAdapter, *, is_repatch: bool = False) ->
         return True
 
     try:
+        try:
+            FeishuAdapter._dispatch_inbound_event = _wrap_feishu_adapter_dispatch_inbound(
+                FeishuAdapter._dispatch_inbound_event
+            )
+        except AttributeError:
+            _logger.debug(
+                "hermes-lark-streaming: FeishuAdapter._dispatch_inbound_event "
+                "not found, serialized-chat aggregation bypass skipped"
+            )
         FeishuAdapter.send = _wrap_feishu_adapter_send(FeishuAdapter.send)
+        for method_name, wrapper in (
+            ("_send_with_retry", _wrap_feishu_delivery_retry),
+            ("_process_message_background", _wrap_feishu_delivery_process),
+            ("connect", _wrap_feishu_delivery_connect),
+            ("disconnect", _wrap_feishu_delivery_disconnect),
+        ):
+            method = getattr(FeishuAdapter, method_name, None)
+            if method is not None:
+                setattr(FeishuAdapter, method_name, wrapper(method))
+        _logger.info("HLS verified delivery hooks installed; enabled=%s", _get_config().verified_final_delivery)
+        if hasattr(FeishuAdapter, "_feishu_send_with_retry"):
+            FeishuAdapter._feishu_send_with_retry = _wrap_feishu_native_send_retry(
+                FeishuAdapter._feishu_send_with_retry
+            )
+            _logger.info("HLS native per-chunk ACK guard installed; enabled=%s", _get_config().independent_final_delivery)
+        try:
+            FeishuAdapter._fetch_message_text = _wrap_feishu_adapter_fetch_message_text(
+                FeishuAdapter._fetch_message_text
+            )
+        except AttributeError:
+            _logger.debug("hermes-lark-streaming: FeishuAdapter._fetch_message_text not found, reply context skipped")
         try:
             FeishuAdapter.edit_message = _wrap_feishu_adapter_edit(FeishuAdapter.edit_message)
         except AttributeError:

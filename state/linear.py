@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from threading import RLock
 
 class ReasoningRound:
     """One round of AI reasoning / thinking."""
@@ -34,6 +35,10 @@ class UnifiedLinearState:
         # v1.7.0 (R2-01): incremental escape cache for answer_text
         "_escaped_cache",
         "_escaped_src_len",
+        "_answer_lock",
+        "answer_revision",
+        "answer_acked_revision",
+        "_answer_frozen",
     )
 
     # v1.7.0 (R2-02): storage caps. Display already trims to max=20 at render
@@ -45,6 +50,10 @@ class UnifiedLinearState:
     _MAX_BG_REVIEW_MESSAGES_STORED = 20
 
     def __init__(self) -> None:
+        self._answer_lock = RLock()
+        self.answer_revision = 0
+        self.answer_acked_revision = 0
+        self._answer_frozen = False
         # Reasoning tracking
         self.reasoning_rounds: list[ReasoningRound] = []
         self._current_reasoning: str = ""
@@ -106,9 +115,38 @@ class UnifiedLinearState:
 
     def on_answer_delta(self, text: str) -> None:
         """Answer text increment. Finalizes any in-progress reasoning first."""
-        self._finalize_current_reasoning()
-        self.answer_text += text
-        self.answer_dirty = True
+        with self._answer_lock:
+            if self._answer_frozen:
+                return
+            self._finalize_current_reasoning()
+            self.answer_text += text
+            self.answer_revision += 1
+            self.answer_dirty = True
+
+    def replace_answer(self, text: str, *, final: bool = False) -> None:
+        """An authoritative final replaces progress, even if it is shorter."""
+        with self._answer_lock:
+            self.answer_text = text
+            self.answer_revision += 1
+            self.answer_dirty = True
+            self.reset_escape_cache()
+            self._answer_frozen = final
+
+    def freeze_answer(self) -> None:
+        """Stop worker-thread deltas once completion accepts the final text."""
+        with self._answer_lock:
+            self._answer_frozen = True
+
+    def answer_snapshot(self) -> tuple[int, str]:
+        with self._answer_lock:
+            return self.answer_revision, self.escaped_answer_view()
+
+    def acknowledge_answer(self, revision: int) -> None:
+        """An old ACK must never clear a newer delta's pending flush."""
+        with self._answer_lock:
+            self.answer_acked_revision = max(self.answer_acked_revision, revision)
+            if revision == self.answer_revision:
+                self.answer_dirty = False
 
     def reset_escape_cache(self) -> None:
         """v1.7.0 (R2-01): invalidate the escaped-answer cache — call after

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
 import time
@@ -60,6 +61,10 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         # v1.3.2 fix: hold strong references to fire-and-forget tasks to prevent
         # GC from collecting them mid-execution (asyncio only holds weak refs).
         self._pending_tasks: set[asyncio.Task] = set()
+        _logger.info(
+            "HLS final delivery mode=%s",
+            "separate_message" if self._cfg.independent_final_delivery else "card",
+        )
 
     def _sess_get(self, message_id: str) -> CardSession | None:
         """Thread-safe session lookup by message_id (or anchor_id)."""
@@ -159,20 +164,60 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
 
     # ── v1.4.0 fix (问题3 根因1): 会话续写重激活 ──────────────────
 
+    def _continuation_aliases(self, message_id: str) -> tuple[str, ...]:
+        """Return every identifier that currently aliases the same card session.
+
+        A replied Feishu message has two valid IDs in Hermes: the inbound
+        ``message_id`` and the quoted ``anchor_id``.  Streaming callbacks may
+        use the anchor while the final completion hook uses the inbound ID.
+        Continuation ownership therefore has to cover both IDs.
+        """
+        aliases = [message_id]
+        session = self._sess_get(message_id)
+        if session is not None:
+            for candidate in (
+                getattr(session, "message_id", None),
+                getattr(session, "anchor_id", None),
+            ):
+                if candidate and candidate not in aliases:
+                    aliases.append(candidate)
+        return tuple(aliases)
+
     def _resolve_continuation_id(self, message_id: str) -> str | None:
-        """查询 message_id 是否已被重激活到 continuation session."""
+        """查询 message_id（含其会话别名）的 continuation session."""
+        aliases = self._continuation_aliases(message_id)
         with self._continuation_map_lock:
-            return self._continuation_map.get(message_id)
+            for alias in aliases:
+                continuation_id = self._continuation_map.get(alias)
+                if continuation_id is not None:
+                    return continuation_id
+        return None
 
     def _register_continuation(self, old_message_id: str, new_message_id: str) -> None:
-        """记录 old_message_id -> new_message_id 的续写映射。线程安全。"""
+        """记录旧会话全部别名 -> new_message_id 的续写映射。线程安全。"""
+        aliases = self._continuation_aliases(old_message_id)
         with self._continuation_map_lock:
-            self._continuation_map[old_message_id] = new_message_id
+            for alias in aliases:
+                self._continuation_map[alias] = new_message_id
 
     def _pop_continuation_id(self, message_id: str) -> str | None:
-        """取出并删除 message_id 对应的 continuation id（用于 on_completed 一次性消费）。"""
+        """一次性消费 message_id（含其会话别名）的 continuation route."""
+        aliases = self._continuation_aliases(message_id)
         with self._continuation_map_lock:
-            return self._continuation_map.pop(message_id, None)
+            continuation_id = None
+            for alias in aliases:
+                continuation_id = self._continuation_map.get(alias)
+                if continuation_id is not None:
+                    break
+            if continuation_id is None:
+                return None
+            stale_aliases = [
+                key for key, value in self._continuation_map.items()
+                if value == continuation_id
+            ]
+            for key in stale_aliases:
+                del self._continuation_map[key]
+            return continuation_id
 
     def _reactivate_session_for_continuation(
         self, stale_session: CardSession
@@ -298,7 +343,7 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
             return None  # 没有原 session，无法重激活
         # 已终态（COMPLETED/ABORTED/CREATION_FAILED/TERMINATED）的 session 不重激活
         # ——on_completed 已封卡，后续 token 是迟到的 race condition，应丢弃而非开新卡
-        if stale.is_terminal_phase:
+        if stale.is_terminal_phase or stale.state == COMPLETING:
             return None
         # _streaming_closed=False 说明流式仍健康，正常路径处理
         if not stale._streaming_closed:
@@ -317,22 +362,24 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         self._register_continuation(message_id, new_session.message_id)
         return new_session.message_id
 
-    def _fire_and_forget(self, coro: Coroutine[Any, Any, Any], loop: asyncio.AbstractEventLoop) -> None:
-        """Schedule a coroutine for background execution without awaiting."""
+    def _fire_and_forget(self, coro: Coroutine[Any, Any, Any], loop: asyncio.AbstractEventLoop):
+        """Schedule on the owning loop, including calls from worker threads."""
         try:
-            task = loop.create_task(coro)
-            # Hold strong reference until task completes
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if loop.is_closed():
+                raise RuntimeError("event loop closed")
+            task = loop.create_task(coro) if running is loop or not loop.is_running() else asyncio.run_coroutine_threadsafe(coro, loop)
             self._pending_tasks.add(task)
             task.add_done_callback(self._pending_tasks.discard)
-        except RuntimeError:
-            # Loop might be closed — try run_coroutine_threadsafe as fallback
-            try:
-                fut = asyncio.run_coroutine_threadsafe(coro, loop)
-                fut.add_done_callback(self._on_bg_task_done)
-            except Exception:
-                # v1.3.2 fix: close the coroutine to avoid 'never awaited' warning
-                coro.close()
-                _logger.debug("fire_and_forget failed", exc_info=True)
+            task.add_done_callback(self._on_bg_task_done)
+            return task
+        except Exception:
+            coro.close()
+            _logger.debug("fire_and_forget failed", exc_info=True)
+            return None
 
     def on_message_started(
         self,
@@ -364,6 +411,21 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
             if id(existing_session) in seen_sessions:
                 continue
             seen_sessions.add(id(existing_session))
+            # A Feishu group can run independent tasks in separate topics or
+            # reply lanes. Only interrupt when the two cards share a lane (or
+            # when either side has no reliable anchor and we must fall back to
+            # the legacy chat-wide behavior).
+            existing_anchor = existing_session.anchor_id
+            if existing_anchor and anchor_id and existing_anchor != anchor_id:
+                _logger.info(
+                    "HLS: concurrency lanes independent — keeping active card "
+                    "msg=%s anchor=%s (new msg=%s anchor=%s)",
+                    existing_msg_id[:12],
+                    existing_anchor[:12],
+                    message_id[:12],
+                    anchor_id[:12],
+                )
+                continue
             _logger.info(
                 "HLS: concurrency limit — sealing old active card "
                 "msg=%s trace=%s chat=%s (new msg=%s arriving)",
@@ -428,7 +490,7 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         if not self.enabled:
             return
         session = self._get_active_session(message_id)
-        if session is None or session.guard.should_skip("on_thinking"):
+        if session is None or session.state == COMPLETING or session.guard.should_skip("on_thinking"):
             return
 
         self._linear_on_thinking(session, text)
@@ -440,7 +502,7 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         if not self._cfg.show_reasoning:
             return
         session = self._get_active_session(message_id)
-        if session is None or session.guard.should_skip("on_reasoning"):
+        if session is None or session.state == COMPLETING or session.guard.should_skip("on_reasoning"):
             return
 
         # Epoch guard: if session entered terminal phase between lookup and
@@ -470,7 +532,7 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         if not self.enabled:
             return
         session = self._get_active_session(message_id)
-        if session is None or session.guard.should_skip("on_tool_update"):
+        if session is None or session.state == COMPLETING or session.guard.should_skip("on_tool_update"):
             return
 
         # Epoch guard: prevent stale writes from previous message's callbacks
@@ -515,7 +577,7 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
                 message_id = new_id
 
         session = self._get_active_session(message_id)
-        if session is None or session.guard.should_skip("on_answer"):
+        if session is None or session.state == COMPLETING or session.guard.should_skip("on_answer"):
             return
 
         # Epoch guard: prevent stale writes from previous message's callbacks
@@ -748,6 +810,12 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
 
         direct_session = self._sess_get(message_id)
         if direct_session is not None and direct_session.state in (COMPLETING, COMPLETED):
+            if answer and strip_reasoning_tags(answer) != direct_session.final_answer:
+                _logger.warning(
+                    "on_completed: distinct final phase; yielding to gateway msg=%s len=%d",
+                    (message_id or "?")[:12], len(answer),
+                )
+                return False
             _logger.info(
                 "on_completed: idempotent, msg=%s state=%s",
                 (message_id or "?")[:12],
@@ -775,6 +843,8 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
                 # 也检查重定向的 session 是否已在完成中
                 redir_session = self._sess_get(redirected_id)
                 if redir_session is not None and redir_session.state in (COMPLETING, COMPLETED):
+                    if answer and strip_reasoning_tags(answer) != redir_session.final_answer:
+                        return False
                     _logger.info(
                         "on_completed: idempotent (redirected), msg=%s -> %s state=%s",
                         (message_id or "?")[:12],
@@ -802,47 +872,24 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         # The yield-to-gateway log above stays INFO (edge case, useful for debugging).
 
         if answer:
+            session.final_answer = strip_reasoning_tags(answer)
             session.text.on_deliver(answer)
             if (
                 session.linear
                 and session.unified_state is not None
             ):
-                from ..state.text import strip_reasoning_tags
-                clean_answer = strip_reasoning_tags(answer)
+                clean_answer = session.final_answer
                 if clean_answer:
                     _existing = session.unified_state.answer_text
-                    _existing_len = len(_existing)
-                    _clean_len = len(clean_answer)
-                    if _existing_len == 0:
-                        # No answer was streamed — use the full on_completed answer
-                        session.unified_state.on_answer_delta(clean_answer)
-                        _logger.info(
-                            "on_completed: linear answer fallback, len=%d msg=%s",
-                            _clean_len, (message_id or "?")[:12],
-                        )
-                    elif _clean_len > _existing_len and clean_answer[:_existing_len] == _existing:
-                        # on_completed answer extends the streamed answer — append diff
-                        _diff = clean_answer[_existing_len:]
-                        if _diff:
-                            session.unified_state.on_answer_delta(_diff)
-                            _logger.info(
-                                "on_completed: linear answer extended, existing=%d added=%d msg=%s",
-                                _existing_len, len(_diff), (message_id or "?")[:12],
-                            )
-                    elif _clean_len > _existing_len and clean_answer[:_existing_len] != _existing:
-                        # only a prefix. Replace with the more complete version.
-                        _logger.warning(
-                            "on_completed: linear answer MISMATCH existing_len=%d clean_len=%d msg=%s "
-                            "existing_head=%r clean_head=%r — replacing with on_completed answer",
-                            _existing_len, _clean_len, (message_id or "?")[:12],
-                            _existing[:60], clean_answer[:60],
-                        )
-                        session.unified_state.answer_text = clean_answer
-                        # v1.7.0 (R2-01): answer_text replaced directly — reset
-                        # the incremental escape cache so the next flush escapes
-                        # the new text from scratch.
-                        session.unified_state.reset_escape_cache()
-                        session.unified_state.answer_dirty = True
+                    if _existing != clean_answer:
+                        # Final response is authoritative regardless of length.
+                        # Progress/preamble/child output may be longer but stale.
+                        session.unified_state.replace_answer(clean_answer, final=True)
+                    _logger.info(
+                        "on_completed: authoritative final len=%d sha256=%s prior_len=%d msg=%s",
+                        len(clean_answer), hashlib.sha256(clean_answer.encode()).hexdigest()[:16],
+                        len(_existing), (message_id or "?")[:12],
+                    )
 
         # ── 保存错误/中断消息 ──
         # 用于在卡片正文中展示（而非仅页脚）
@@ -869,6 +916,8 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
             **({"cost_status": cost_status} if cost_status and cost_status != "unknown" else {}),
         }
 
+        if session.unified_state is not None:
+            session.unified_state.freeze_answer()
         session.state = COMPLETING
 
         self._complete_session(session)
@@ -886,7 +935,7 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         if not self.enabled or not text or not callable(sender):
             return False
         session = self._get_active_session(message_id)
-        if session is None:
+        if session is None or session.state == COMPLETING:
             return False
 
         # Try to push into linear state for real-time card display
@@ -918,6 +967,7 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
                 _logger.debug("background review sender failed", exc_info=True)
 
     def _cleanup(self, message_id: str) -> None:
+        session_aliases = self._continuation_aliases(message_id)
         session = self._sess_pop(message_id)
         if session is None:
             return
@@ -930,13 +980,38 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
             stale_keys = [k for k, v in self._interrupt_map.items() if v == message_id]
             for k in stale_keys:
                 del self._interrupt_map[k]
-        # v1.4.0 fix: 清理 _continuation_map 中以本 message_id 为 old 或 new 的条目。
+        # Keep an outgoing route while its continuation is still active.
+        # on_completed(old_message_id) owns and consumes that route; removing it
+        # here races with gateway completion and can leave the continuation card
+        # permanently open.
         with self._continuation_map_lock:
-            self._continuation_map.pop(message_id, None)
-            stale_cont_keys = [k for k, v in self._continuation_map.items() if v == message_id]
+            continuation_id = next(
+                (
+                    self._continuation_map[alias]
+                    for alias in session_aliases
+                    if alias in self._continuation_map
+                ),
+                None,
+            )
+        continuation_session = (
+            self._sess_get(continuation_id) if continuation_id is not None else None
+        )
+        preserve_outgoing_route = bool(
+            continuation_session is not None
+            and not continuation_session.is_terminal_phase
+        )
+        with self._continuation_map_lock:
+            if not preserve_outgoing_route:
+                for alias in session_aliases:
+                    self._continuation_map.pop(alias, None)
+            stale_cont_keys = [
+                key for key, value in self._continuation_map.items()
+                if value in session_aliases
+            ]
             for k in stale_cont_keys:
                 del self._continuation_map[k]
-        session.flush.mark_completed()
+        session.flush.abort_pending()
+        session.writer.close()
 
     def _release_session_data(self, session: CardSession) -> None:
         """完成后释放重数据，仅保留最小元数据供 TTL 追踪."""
@@ -947,23 +1022,57 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         session.footer = {}
 
     def _complete_session(self, session: CardSession) -> None:
-        """根据 session 线性/非线性选择完成路径."""
-        if session.linear and session.unified_state:
-            self._fire_and_forget(self._do_linear_complete_with_fallback(session), session._loop)
-        else:
-            # path so the card still completes (rather than deadlocking).
+        """Track completion so cancellation and stale-session cleanup can end it."""
+        if session.completion_task is not None and not session.completion_task.done():
+            return
+        session.completion_started_at = time.monotonic()
+        task = self._fire_and_forget(self._do_linear_complete_with_fallback(session), session._loop)
+        session.completion_task = task
+        if task is None:
+            self._terminate_completion(session, source="completion_schedule_failed")
+            session.mark_delivery_done(False)
+            return
+
+        def finished(future):
+            # A task cancelled before its first instruction never runs finally.
+            if future.cancelled() and not session._delivery_done.is_set():
+                self._terminate_completion(session, source="completion_cancelled")
+                session.mark_delivery_done(False)
+            if session.completion_task is future:
+                session.completion_task = None
+
+        task.add_done_callback(finished)
+
+    async def wait_for_delivery(self, message_id: str, timeout: float = 12.0) -> bool:
+        """Wait until a card is sealed or its text fallback has finished."""
+        session = self._sess_get(message_id)
+        if session is None:
+            continuation_id = self._resolve_continuation_id(message_id)
+            if continuation_id:
+                session = self._sess_get(continuation_id)
+        if session is None:
+            return False
+        try:
+            await asyncio.wait_for(session._delivery_done.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
             _logger.warning(
-                "_complete_session: non-linear session dispatched to linear "
-                "completer (non-linear path removed in v1.1.0), msg=%s",
-                (session.message_id or "?")[:12],
+                "HLS: delivery wait timed out msg=%s state=%s timeout=%.1fs",
+                (message_id or "?")[:12],
+                session.state,
+                timeout,
             )
-            self._fire_and_forget(self._do_linear_complete_with_fallback(session), session._loop)
+            return False
+        return session._delivery_success
 
     async def _do_linear_complete_with_fallback(self, session: CardSession) -> None:
-        """线性模式完成，卡片不可用时回退为文本回复."""
+        """Bound every completion, preserving the full final for fallback."""
+        if not session.completion_started_at:
+            session.completion_started_at = time.monotonic()
         # Snapshot fallback text before _do_linear_complete potentially releases it
         _fallback_text = ""
-        if session.error_message:
+        if session.final_answer:
+            _fallback_text = session.final_answer
+        elif session.error_message:
             _fallback_text = session.error_message
         elif session.unified_state and session.unified_state.answer_text:
             _fallback_text = session.unified_state.answer_text
@@ -971,48 +1080,132 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
             _fallback_text = session.text.display_text
 
         try:
-            result = await self._do_linear_complete(session)
-            if not result:
-                await self._send_text_fallback(session, fallback_text=_fallback_text)
-        except Exception:
-            _logger.warning(
-                "linear complete with fallback failed: msg=%s",
-                (session.message_id or "?")[:12],
-                exc_info=True,
-            )
-            await self._send_text_fallback(session, fallback_text=_fallback_text)
+            source = "completion_failed"
+            try:
+                result = await asyncio.wait_for(
+                    self._do_linear_complete(session),
+                    timeout=self._cfg.card_completion_timeout_sec,
+                )
+            except asyncio.TimeoutError:
+                source = "completion_timeout"
+                result = False
+                _logger.warning("card completion timed out: msg=%s", (session.message_id or "?")[:12])
+            except Exception:
+                _logger.warning("linear completion failed: msg=%s", (session.message_id or "?")[:12], exc_info=True)
+                result = False
+            if result:
+                session.mark_delivery_done(True)
+            else:
+                await self._finish_failed_completion_with_fallback(
+                    session, fallback_text=_fallback_text, source=source,
+                )
+        except asyncio.CancelledError:
+            # Cancellation must not leave COMPLETING live forever or send new
+            # messages after shutdown. Durable final delivery is independent.
+            self._terminate_completion(session, source="completion_cancelled")
+            session.mark_delivery_done(False)
+            self._release_session_data(session)
+            raise
+        finally:
+            session.flush.abort_pending()
+            session.writer.close()
+            session._card_ready.set()
+            if not session._delivery_done.is_set():
+                session.mark_delivery_done(False)
 
-    async def _send_text_fallback(self, session: CardSession, *, fallback_text: str = "") -> None:
-        """卡片不可用时，通过飞书 API 发送文本回复作为兜底."""
-        if not self._client:
-            return
+    def _terminate_completion(self, session: CardSession, *, source: str) -> None:
+        """End lifecycle before any further await can be cancelled or time out."""
+        if not session.is_terminal_phase:
+            session.state = CREATION_FAILED
+            session.enter_terminal(reason=TerminalReason.CREATION_FAILED, source=source)
+        session.flush.abort_pending()
+        session.writer.close()
+        session._card_ready.set()
+
+    async def _finish_failed_completion_with_fallback(
+        self,
+        session: CardSession,
+        *,
+        fallback_text: str,
+        source: str,
+    ) -> None:
+        """Terminate a failed card and publish the fallback delivery result."""
+        self._terminate_completion(session, source=source)
+        fallback_ok = False
         try:
-            # 优先使用调用方传入的 fallback_text（在 _release_session_data 前快照的）
-            # 其次从 session 读取（用于 _do_linear_complete_with_fallback 以外的调用路径）
-            text = fallback_text or session.error_message or (session.text.display_text if session.text else "") or ""
-            if not text.strip():
-                return
-            # 限制长度避免过长
-            if len(text) > 4000:
-                text = text[:4000] + "..."
-            from ..cardkit.md import optimize_markdown_style
-            content = optimize_markdown_style(text) or text
-            reply_id = session.anchor_id or session.message_id
-            await self._client.reply_text(reply_id, content)
-            _logger.info(
-                "text fallback sent: msg=%s len=%d",
-                (session.message_id or "?")[:12],
-                len(content),
-            )
-        except Exception:
-            pass
+            # The normal writer is closed and its transport cancelled. Make
+            # one bounded attempt to stop the server-side typing animation;
+            # failure here must never prevent the independent final/fallback.
+            close_stream = getattr(self._client, "cardkit_close_streaming", None)
+            if close_stream is not None and session.card_id and session.state != TERMINATED and not session._streaming_closed:
+                try:
+                    session.sequence += 1
+                    await asyncio.wait_for(close_stream(
+                        session.card_id, sequence=session.sequence, summary="",
+                    ), timeout=2.0)
+                    session._streaming_closed = True
+                except Exception:
+                    _logger.warning("failed card could not close streaming msg=%s", (session.message_id or "?")[:12], exc_info=True)
+            if getattr(self._cfg, "independent_final_delivery", False):
+                _logger.warning("progress card seal failed; gateway retains final delivery ownership")
+            elif session.state != TERMINATED:
+                fallback_ok = await self._send_text_fallback(session, fallback_text=fallback_text)
+        finally:
+            self._release_session_data(session)
+            session.mark_delivery_done(fallback_ok)
+
+    async def _send_text_fallback(self, session: CardSession, *, fallback_text: str = "") -> bool:
+        """卡片不可用时，通过飞书 API 发送文本回复作为兜底."""
+        text = fallback_text or session.final_answer or session.error_message or (session.text.display_text if session.text else "") or ""
+        if not text.strip():
+            return False
+        if not self._client:
+            raise RuntimeError("text fallback unavailable: client not initialized")
+        reply_id = session.anchor_id or session.message_id
+        content_hash = hashlib.sha256(text.encode()).hexdigest()
+        # 3000 Unicode characters fit comfortably below the IM text byte limit.
+        # No Markdown rewrite or truncation: concatenating chunks is lossless.
+        for index, start in enumerate(range(0, len(text), 3000)):
+            content = text[start:start + 3000]
+            key = hashlib.sha256(f"hls-final:{session.message_id}:{reply_id}:{index}:{content_hash}".encode()).hexdigest()[:32]
+            if key in session.fallback_message_ids:
+                continue
+            for attempt in range(3):
+                try:
+                    sent_id = await asyncio.wait_for(
+                        self._client.reply_text(reply_id, content, uuid=key), timeout=12.0,
+                    )
+                    if not sent_id:
+                        raise RuntimeError("text fallback response missing message_id")
+                    session.fallback_message_ids[key] = sent_id
+                    break
+                except Exception:
+                    if attempt == 2:
+                        _logger.error("text fallback failed: msg=%s part=%d", (session.message_id or "?")[:12], index + 1, exc_info=True)
+                        raise
+                    await asyncio.sleep(0.3 * (attempt + 1))
+        _logger.info("text fallback acknowledged: msg=%s len=%d parts=%d", (session.message_id or "?")[:12], len(text), (len(text) + 2999) // 3000)
+        return True
 
     def _prune_stale_sessions(self) -> None:
-        """v1.1.1: 只清理已终态的过期 session，保护活跃 session."""
+        """Protect active model runs; reap orphaned completion tasks separately."""
         now = time.time()
+        monotonic_now = time.monotonic()
+        seen: set[int] = set()
         # v1.3.0 P1-05: show longer msg_id in prune logs for easier log correlation.
         # v1.3.0 P1-01: use thread-safe snapshot to avoid RuntimeError.
         for mid, s in self._sess_items_snapshot():
+            if mid is None or id(s) in seen:
+                continue
+            seen.add(id(s))
+            if s.state == COMPLETING and (
+                (s.completion_started_at and monotonic_now - s.completion_started_at > self._cfg.card_completion_timeout_sec + 1.0)
+                or (not s.completion_started_at and now - s.created_at > self._session_ttl)
+            ):
+                self._terminate_completion(s, source="stale_completion")
+                if s.completion_task is not None and not s.completion_task.done():
+                    s._loop.call_soon_threadsafe(s.completion_task.cancel)
+                s.mark_delivery_done(False)
             if mid is None or now - s.created_at <= self._session_ttl:
                 continue
             if s.is_terminal_phase:
@@ -1027,6 +1220,8 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
 
     @staticmethod
     def _on_bg_task_done(fut: ConcurrentFuture) -> None:
+        if fut.cancelled():
+            return
         try:
             fut.result()
         except Exception:

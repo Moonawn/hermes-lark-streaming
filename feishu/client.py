@@ -326,7 +326,7 @@ class FeishuClient:
             return str(resp.data.message_id)
         raise FeishuAPIError("reply_card: response missing message_id")
 
-    async def reply_text(self, message_id: str, text: str) -> str:
+    async def reply_text(self, message_id: str, text: str, *, uuid: str | None = None) -> str:
         """回复纯文本消息，返回 message_id."""
         request = (
             ReplyMessageRequest.builder()
@@ -335,6 +335,7 @@ class FeishuClient:
                 ReplyMessageRequestBody.builder()
                 .msg_type("text")
                 .content(self._dumps({"text": text}))
+                .uuid(uuid)
                 .build()
             )
             .build()

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
+import threading
 import time
 from typing import Any, Callable
 
 from .. import __version__
 from ..state.phase import TERMINAL_PHASES
 from . import (
+    _get_config,
     _msg_ctx,
     _started_msg_ids,
     _started_msg_ids_lock,
@@ -17,13 +20,199 @@ from . import (
     _send_result_ok,
 )
 
+_chat_serial_locks: dict[tuple[int, str], asyncio.Lock] = {}
+_chat_serial_owners: dict[tuple[int, str], asyncio.Task[Any] | None] = {}
+_chat_serial_locks_guard = threading.Lock()
+_UNAVAILABLE_MESSAGE_CODES = {230011, 231003, 1000023}
+
+
+def _is_serialized_feishu_chat(source: Any) -> bool:
+    platform = getattr(getattr(source, "platform", None), "value", "")
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    if str(platform).lower() not in ("feishu", "lark") or not chat_id:
+        return False
+    try:
+        from ..config import Config
+
+        return chat_id in Config().serialized_chat_ids
+    except Exception:
+        _logger.debug("HLS: serialized chat config lookup failed", exc_info=True)
+        return False
+
+
+def _chat_serial_lock(chat_id: str) -> tuple[tuple[int, str], asyncio.Lock]:
+    loop = asyncio.get_running_loop()
+    key = (id(loop), chat_id)
+    with _chat_serial_locks_guard:
+        lock = _chat_serial_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _chat_serial_locks[key] = lock
+    return key, lock
+
+
+def _is_serial_control_command(event: Any) -> bool:
+    text = str(getattr(event, "text", "") or "").strip().lower()
+    return text == "/stop" or text.startswith("/stop ")
+
+
+async def _waiting_message_is_available(runner: Any, event: Any) -> bool:
+    """Fail closed only for an explicit Feishu recalled/deleted response."""
+    message_id = str(getattr(event, "message_id", "") or "").strip()
+    source = getattr(event, "source", None)
+    if not message_id or source is None:
+        return True
+    try:
+        adapter = runner._adapter_for_source(source)
+        client = getattr(adapter, "_client", None)
+        if (
+            adapter is None
+            or client is None
+            or not hasattr(adapter, "_build_get_message_request")
+            or not hasattr(adapter, "_run_blocking")
+        ):
+            return True
+        request = adapter._build_get_message_request(message_id)
+        response = await asyncio.wait_for(
+            adapter._run_blocking(client.im.v1.message.get, request), timeout=3.0,
+        )
+        if response and getattr(response, "success", lambda: False)():
+            return True
+        code = int(getattr(response, "code", 0) or 0)
+        if code in _UNAVAILABLE_MESSAGE_CODES:
+            _logger.info(
+                "HLS: dropping unavailable queued message msg=%s code=%s",
+                message_id[:12],
+                code,
+            )
+            return False
+        _logger.warning(
+            "HLS: queued message availability check inconclusive; failing open "
+            "msg=%s code=%s",
+            message_id[:12],
+            code,
+        )
+    except Exception:
+        _logger.warning(
+            "HLS: queued message availability check failed; failing open msg=%s",
+            message_id[:12],
+            exc_info=True,
+        )
+    return True
+
 # ── GatewayRunner method wrappers ──────────────────────────────────
+
+def _wrap_deliver_queued_first_response(orig: Callable) -> Callable:
+    """Seal the current task card before Hermes starts its queued follow-up."""
+
+    @functools.wraps(orig)
+    async def wrapper(
+        self,
+        response,
+        source,
+        adapter,
+        metadata=None,
+        event_message_id=None,
+        text_already_delivered=False,
+        deliver_media=True,
+    ):
+        if _is_serialized_feishu_chat(source) and event_message_id:
+            try:
+                from ..config import Config
+                from ..controller import get_controller
+
+                ctrl = get_controller()
+                session = ctrl._sess_get(event_message_id) if ctrl else None
+                if ctrl and ctrl.enabled and session is not None:
+                    card_owned = ctrl.on_completed(
+                        message_id=event_message_id,
+                        answer=response or "",
+                    )
+                    card_or_fallback_delivered = False
+                    if card_owned and not _get_config().independent_final_delivery:
+                        card_or_fallback_delivered = await ctrl.wait_for_delivery(
+                            event_message_id,
+                            timeout=Config().delivery_wait_timeout_sec,
+                        )
+                    if card_or_fallback_delivered:
+                        text_already_delivered = True
+                        _logger.info(
+                            "HLS: queued-turn delivery confirmed before follow-up "
+                            "msg=%s state=%s",
+                            str(event_message_id)[:12],
+                            session.state,
+                        )
+                    else:
+                        _logger.warning(
+                            "HLS: queued-turn delivery unconfirmed; retaining Hermes "
+                            "text fallback msg=%s state=%s",
+                            str(event_message_id)[:12],
+                            session.state,
+                        )
+            except Exception:
+                _logger.warning(
+                    "HLS: queued-turn pre-follow-up completion failed msg=%s",
+                    str(event_message_id or "?")[:12],
+                    exc_info=True,
+                )
+
+        return await orig(
+            self,
+            response,
+            source,
+            adapter,
+            metadata=metadata,
+            event_message_id=event_message_id,
+            text_already_delivered=text_already_delivered,
+            deliver_media=deliver_media,
+        )
+
+    return wrapper
+
 
 def _wrap_handle_message(orig: Callable) -> Callable:
     """Inject NORMALIZE hook at the top of GatewayRunner._handle_message."""
 
     @functools.wraps(orig)
     async def wrapper(self, event, *args, **kwargs):
+        source = getattr(event, "source", None)
+        if _is_serialized_feishu_chat(source) and not _is_serial_control_command(event):
+            chat_id = str(getattr(source, "chat_id", "") or "")
+            key, lock = _chat_serial_lock(chat_id)
+            current_task = asyncio.current_task()
+            if _chat_serial_owners.get(key) is not current_task:
+                queued = lock.locked()
+                wait_started = time.monotonic()
+                if queued:
+                    _logger.info(
+                        "HLS: task-group queue waiting chat=%s msg=%s",
+                        chat_id[:12],
+                        str(getattr(event, "message_id", "") or "?")[:12],
+                    )
+                async with lock:
+                    _chat_serial_owners[key] = current_task
+                    try:
+                        waited = time.monotonic() - wait_started
+                        if queued:
+                            try:
+                                from ..config import Config
+
+                                verify_available = Config().verify_waiting_message_available
+                            except Exception:
+                                verify_available = True
+                            if verify_available and not await _waiting_message_is_available(self, event):
+                                return None
+                            _logger.info(
+                                "HLS: task-group queue acquired chat=%s msg=%s wait=%.3fs",
+                                chat_id[:12],
+                                str(getattr(event, "message_id", "") or "?")[:12],
+                                waited,
+                            )
+                        return await wrapper(self, event, *args, **kwargs)
+                    finally:
+                        if _chat_serial_owners.get(key) is current_task:
+                            _chat_serial_owners.pop(key, None)
+
         # NORMALIZE hook — fires before any message processing
         try:
             from .hooks import on_feishu_normalize
@@ -72,6 +261,14 @@ def _wrap_handle_message_with_agent(orig: Callable) -> Callable:
 
     @functools.wraps(orig)
     async def wrapper(self, event, source, *args, **kwargs):
+        # This wrapper owns Feishu/Lark card lifecycle only.  GatewayRunner
+        # also routes A2A and other platforms through the same method; letting
+        # those messages enter HLS creates cards with non-Feishu message IDs
+        # and causes avoidable OpenAPI failures.
+        platform_name = getattr(getattr(source, "platform", None), "value", "").lower()
+        if platform_name not in ("feishu", "lark"):
+            return await orig(self, event, source, *args, **kwargs)
+
         mid = event.message_id
         anchor_id = self._reply_anchor_for_event(event)
         chat_id = source.chat_id if hasattr(source, "chat_id") else ""
@@ -118,10 +315,52 @@ def _wrap_handle_message_with_agent(orig: Callable) -> Callable:
 
         # point to the new message's context. We must use the original
         ctx = msg_context
+        if ctx.get("final_yielded"):
+            _hls_cleanup_ctx()
+            return result
+        serialized_chat = _is_serialized_feishu_chat(source)
+        if serialized_chat and ctx.get("card_sent") and not _get_config().independent_final_delivery:
+            try:
+                from ..config import Config
+                from ..controller import get_controller
+
+                _ctrl = get_controller()
+                _eid = ctx.get("event_message_id") or mid
+                ctx["delivery_confirmed"] = await _ctrl.wait_for_delivery(
+                    _eid,
+                    timeout=Config().delivery_wait_timeout_sec,
+                )
+                if not ctx["delivery_confirmed"]:
+                    _logger.warning(
+                        "HLS: serialized card delivery not confirmed msg=%s; "
+                        "gateway fallback remains enabled",
+                        (_eid or "?")[:12],
+                    )
+            except Exception:
+                ctx["delivery_confirmed"] = False
+                _logger.warning(
+                    "HLS: serialized card delivery wait failed msg=%s",
+                    mid[:12],
+                    exc_info=True,
+                )
+
+        if _get_config().independent_final_delivery:
+            # Progress-card completion is asynchronous and has no delivery ACK.
+            # Leave the final response intact for the native gateway to send.
+            if result is None:
+                from ..controller import get_controller
+                _session = get_controller()._sess_get(mid)
+                if _session and _session.state not in TERMINAL_PHASES and _session.state != "completing":
+                    from .hooks import on_message_aborted
+                    on_message_aborted(message_id=mid)
+            _hls_cleanup_ctx()
+            return result
 
         # AST injection, so we return None to simulate "stale agent result",
         if result is not None:
-            if ctx and ctx.get("card_sent"):
+            if ctx and ctx.get("card_sent") and (
+                not serialized_chat or ctx.get("delivery_confirmed")
+            ):
                 _logger.info(
                     "card already sent for msg=%s, suppressing gateway reply",
                     mid[:12],
@@ -136,13 +375,21 @@ def _wrap_handle_message_with_agent(orig: Callable) -> Callable:
                     if _eid:
                         _sess = _ctrl._sess_get(_eid)
                         if _sess and _sess.card_msg_id:
-                            _logger.info(
-                                "card session exists for msg=%s (state=%s), suppressing gateway reply",
-                                mid[:12], _sess.state,
-                            )
-                            ctx["card_sent"] = True
-                            _hls_cleanup_ctx()
-                            return None
+                            if serialized_chat and not ctx.get("delivery_confirmed"):
+                                _logger.warning(
+                                    "card session exists but delivery is unconfirmed for "
+                                    "serialized msg=%s (state=%s); allowing gateway fallback",
+                                    mid[:12],
+                                    _sess.state,
+                                )
+                            else:
+                                _logger.info(
+                                    "card session exists for msg=%s (state=%s), suppressing gateway reply",
+                                    mid[:12], _sess.state,
+                                )
+                                ctx["card_sent"] = True
+                                _hls_cleanup_ctx()
+                                return None
             except Exception:
                 _logger.warning("HLS: suppressed exception", exc_info=True)
         # None (the "Discarding stale agent result" path or the
@@ -321,6 +568,7 @@ def _wrap_run_agent(orig: Callable) -> Callable:
         # - B's card quotes A's text (stale session content)
         ctx = _msg_ctx.get()
         if _saved_parent_ctx is not None:
+            child_card_owned = False
             # Step 1: Fire B's (child) COMPLETE hook normally
             if ctx is not None:
                 try:
@@ -379,13 +627,18 @@ def _wrap_run_agent(orig: Callable) -> Callable:
                         estimated_cost_usd=estimated_cost_usd,
                         cost_status=cost_status,
                     )
-                    if card_sent_child:
+                    if card_sent_child and not _get_config().independent_final_delivery:
+                        child_card_owned = True
                         result["already_sent"] = True
                         ctx["card_sent"] = True
+                        ctx["final_yielded"] = False
                         _logger.info(
                             "run_agent: child COMPLETE hook fired for msg=%s card_sent=True",
                             (ctx["message_id"] or "?")[:12],
                         )
+                    elif not card_sent_child:
+                        ctx["card_sent"] = False
+                        ctx["final_yielded"] = True
                 except Exception:
                     _logger.debug("run_agent: child COMPLETE hook failed", exc_info=True)
 
@@ -399,13 +652,18 @@ def _wrap_run_agent(orig: Callable) -> Callable:
                     aborted=True,
                     error_message="Interrupted by new message",
                 )
-                _saved_parent_ctx["card_sent"] = True
+                if not _get_config().independent_final_delivery:
+                    _saved_parent_ctx["card_sent"] = True
                 # BUG FIX (v0.15.4): Also set card_sent on the original
-                if _original_msg_context_ref is not None:
+                if _original_msg_context_ref is not None and not _get_config().independent_final_delivery:
                     _original_msg_context_ref["card_sent"] = True
                 # Also mark already_sent so Hermes's gateway doesn't send text reply
-                if isinstance(result, dict):
+                if isinstance(result, dict) and child_card_owned:
                     result["already_sent"] = True
+                if not child_card_owned:
+                    _saved_parent_ctx["final_yielded"] = True
+                    if _original_msg_context_ref is not None:
+                        _original_msg_context_ref["final_yielded"] = True
             except Exception:
                 _logger.debug("run_agent: parent ABORTED completion failed", exc_info=True)
         elif ctx is not None:
@@ -466,9 +724,13 @@ def _wrap_run_agent(orig: Callable) -> Callable:
                     estimated_cost_usd=estimated_cost_usd,
                     cost_status=cost_status,
                 )
-                if card_sent:
+                if card_sent and not _get_config().independent_final_delivery:
                     result["already_sent"] = True
                     ctx["card_sent"] = True
+                    ctx["final_yielded"] = False
+                elif not card_sent:
+                    ctx["card_sent"] = False
+                    ctx["final_yielded"] = True
             except Exception:
                 _logger.warning("HLS: suppressed exception", exc_info=True)
         # _msg_ctx now points to the child message's context. We must
@@ -573,6 +835,8 @@ def _wrap_run_background_task(orig: Callable) -> Callable:
 
             async def _intercepting_send(chat_id, content, **send_kwargs):
                 """Suppress plain text delivery when our card was sent."""
+                if _get_config().independent_final_delivery:
+                    return await original_send(chat_id, content, **send_kwargs)
                 ctx = _msg_ctx.get()
                 if ctx and ctx.get("card_sent"):
                     try:
@@ -631,7 +895,7 @@ def _wrap_run_background_task(orig: Callable) -> Callable:
                         cost_status=cost_status,
                     )
 
-                    if card_sent:
+                    if card_sent and not _get_config().independent_final_delivery:
                         ctx["card_sent"] = True
                         # Mark result so upstream knows card was sent
                         if result is not None and isinstance(result, dict):

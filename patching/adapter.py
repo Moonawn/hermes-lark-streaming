@@ -3,23 +3,115 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import re
 import threading
 import time
-from typing import Any, Callable
+from collections import OrderedDict
+from collections.abc import Callable
+from typing import Any
 
 from .. import __version__
 from . import (
-    _msg_ctx,
     _gateway_cards,
     _gateway_cards_lock,
-    _logger,
     _get_config,
+    _logger,
+    _msg_ctx,
     _patched_feishu_classes,
     _send_result_ok,
 )
 
 # ── FeishuAdapter interception layer (Phase 1: gateway message cards) ─
+
+_CARD_REPLY_CONTEXT_MAX = 500
+_CARD_REPLY_CONTEXT_CHARS = 2000
+_card_reply_contexts: OrderedDict[str, str] = OrderedDict()
+_card_reply_contexts_lock = threading.Lock()
+
+
+def _normalize_card_reply_context(answer: str) -> str:
+    """Return a compact, bounded parent-message excerpt."""
+    if not isinstance(answer, str):
+        return ""
+    excerpt = re.sub(r"\s+", " ", answer).strip()
+    if len(excerpt) > _CARD_REPLY_CONTEXT_CHARS:
+        excerpt = excerpt[: _CARD_REPLY_CONTEXT_CHARS - 1].rstrip() + "…"
+    return excerpt
+
+
+def _register_card_reply_context(card_msg_id: str | None, answer: str) -> None:
+    """Remember completed CardKit text independently of live card sessions."""
+    excerpt = _normalize_card_reply_context(answer)
+    if not card_msg_id or not excerpt:
+        return
+    with _card_reply_contexts_lock:
+        _card_reply_contexts[card_msg_id] = excerpt
+        _card_reply_contexts.move_to_end(card_msg_id)
+        while len(_card_reply_contexts) > _CARD_REPLY_CONTEXT_MAX:
+            _card_reply_contexts.popitem(last=False)
+
+
+def _lookup_card_reply_context(card_msg_id: str) -> str | None:
+    with _card_reply_contexts_lock:
+        excerpt = _card_reply_contexts.get(card_msg_id)
+        if excerpt is not None:
+            _card_reply_contexts.move_to_end(card_msg_id)
+        return excerpt
+
+
+def _is_unusable_interactive_fallback(text: Any) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return True
+    normalized = text.strip().casefold()
+    return normalized == "[interactive message]" or "请升级至最新版本客户端，以查看内容" in normalized
+
+
+def _wrap_feishu_adapter_fetch_message_text(orig_fetch: Callable) -> Callable:
+    """Recover CardKit parent text only when Hermes returns its fallback."""
+    async def _intercepted_fetch(self_feishu, message_id: str):
+        text = await orig_fetch(self_feishu, message_id)
+        if not _is_unusable_interactive_fallback(text):
+            return text
+        excerpt = _lookup_card_reply_context(message_id)
+        if excerpt is not None:
+            _logger.debug(
+                "HLS: recovered CardKit reply context msg=%s excerpt_len=%d",
+                (message_id or "?")[:12], len(excerpt),
+            )
+            return excerpt
+        return text
+
+    return _intercepted_fetch
+
+def _wrap_feishu_adapter_dispatch_inbound(orig_dispatch: Callable) -> Callable:
+    """Keep serialized task-chat text messages as distinct queue entries."""
+
+    async def _intercepted_dispatch(self_feishu, event):
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        message_type = getattr(event, "message_type", None)
+        message_type_value = str(getattr(message_type, "value", message_type) or "")
+        is_command = bool(getattr(event, "is_command", lambda: False)())
+
+        if (
+            chat_id
+            and message_type_value == "text"
+            and not is_command
+            and chat_id in _get_config().serialized_chat_ids
+        ):
+            _logger.info(
+                "HLS: serialized chat bypassing Feishu text aggregation "
+                "chat=%s msg=%s",
+                chat_id[:12],
+                str(getattr(event, "message_id", "") or "?")[:12],
+            )
+            return await self_feishu._handle_message_with_guards(event)
+
+        return await orig_dispatch(self_feishu, event)
+
+    return _intercepted_dispatch
 
 def _classify_gateway_message(content: str) -> str:
     """Classify a gateway-internal message by its content for card category."""
@@ -52,6 +144,7 @@ async def _dispatch_feishu_outbound(
     content,
     passthrough: Callable[[], Any],
     *,
+    reply_to: str | None = None,
     metadata: Any = None,
 ):
     """Shared interception for ALL feishu-bound plain-text sends (v1.7.0).
@@ -82,6 +175,25 @@ async def _dispatch_feishu_outbound(
 
     if getattr(adapter, "_hls_cron_sending", 0) or getattr(adapter, "_hls_bg_sending", 0):
         return await passthrough()
+
+    if _get_config().independent_final_delivery and not _is_cron_delivery_metadata(metadata):
+        # Final delivery also happens after the gateway ContextVar is reset.
+        # A progress card must not suppress that native/verified final send.
+        if _use_verified_delivery(adapter, chat_id, content):
+            from gateway.platforms.base import SendResult
+            from ..feishu.delivery import get_delivery
+            try:
+                sender = get_delivery(adapter)
+                sender.start()
+                return await sender.deliver(chat_id, content, reply_to, metadata)
+            except Exception as exc:
+                _logger.error("HLS verified sender unavailable: %s", type(exc).__name__)
+                return SendResult(success=False, retryable=False,
+                                  error="Final delivery receipt unavailable; no untracked send attempted")
+        result = await passthrough()
+        _logger.info("independent message delivery: len=%d success=%s",
+                     len(content), getattr(result, "success", None))
+        return result
 
     # ── Cron delivery lane (v1.7.0 RELAY fix, P1) ──
     # In relay-fronted deployments _wrap_cron_deliver finds no native
@@ -120,6 +232,35 @@ async def _dispatch_feishu_outbound(
     if ctx is not None:
         eid = ctx.get("event_message_id", "")
         if eid:
+            # An existing card alone is not ownership of this text. In
+            # particular, a second final phase must not be swallowed by the
+            # first phase's card_sent flag.
+            allow_plain = False
+            try:
+                from ..controller import get_controller
+                from ..state.text import strip_reasoning_tags
+                _session = get_controller()._sess_get(eid)
+                if _session is not None:
+                    _final = getattr(_session, "final_answer", "")
+                    if (
+                        _session.state in ("completing", "completed")
+                        and _final and strip_reasoning_tags(content) != _final
+                    ):
+                        allow_plain = True
+                    if _session.state in ("creation_failed", "terminated"):
+                        # Failure must not become a synthetic SendResult(True).
+                        allow_plain = True
+                    if (
+                        chat_id in _get_config().serialized_chat_ids
+                        and _session.state not in ("completing", "completed", "aborted")
+                    ):
+                        allow_plain = True
+            except Exception:
+                _logger.debug("final ownership lookup failed", exc_info=True)
+            if allow_plain:
+                # Transport exceptions must escape; catching them inside the
+                # lookup guard could otherwise turn failure into card_sent OK.
+                return await passthrough()
             # We're inside an agent message pipeline.
             # If card was already sent, suppress the gateway's text reply.
             if ctx.get("card_sent"):
@@ -275,6 +416,7 @@ def _wrap_feishu_adapter_send(orig_send: Callable) -> Callable:
             chat_id,
             content,
             lambda: orig_send(self_feishu, chat_id, content, reply_to=reply_to, metadata=metadata, **kwargs),
+            reply_to=reply_to,
             metadata=metadata,
         )
     return _intercepted_send
@@ -337,6 +479,7 @@ def _wrap_relay_adapter_send(orig_send: Callable) -> Callable:
             chat_id,
             content,
             lambda: orig_send(self_relay, chat_id, content, reply_to=reply_to, metadata=metadata, **kwargs),
+            reply_to=reply_to,
             metadata=metadata,
         )
     return _intercepted_relay_send
@@ -355,9 +498,102 @@ def _wrap_relay_adapter_send_for_platform(orig_sfp: Callable) -> Callable:
             chat_id,
             content,
             lambda: orig_sfp(self_relay, logical_platform, chat_id, content, reply_to=reply_to, metadata=metadata, **kwargs),
+            reply_to=reply_to,
             metadata=metadata,
         )
     return _intercepted_relay_sfp
+
+def _use_verified_delivery(adapter, chat_id, content) -> bool:
+    if not getattr(_get_config(), "verified_final_delivery", False):
+        return False
+    if not isinstance(content, str) or not content.strip() or not str(chat_id).startswith("oc_"):
+        return False
+    if getattr(adapter, "_hls_cron_sending", 0) or getattr(adapter, "_hls_bg_sending", 0):
+        return False
+    from ..feishu.delivery import delivery_context
+    if (delivery_context.get() or {}).get("ephemeral"):
+        return False
+    try:
+        from gateway.platforms.base import EphemeralReply
+        if isinstance(content, EphemeralReply):
+            return False
+    except ImportError:
+        pass
+    return True
+
+
+def _wrap_feishu_delivery_retry(orig: Callable) -> Callable:
+    """The durable sender owns retries. Do not fall through to content[:3500]."""
+    @functools.wraps(orig)
+    async def wrapper(self_feishu, chat_id, content, reply_to=None, metadata=None,
+                      max_retries=2, base_delay=2.0):
+        if _use_verified_delivery(self_feishu, chat_id, content):
+            return await self_feishu.send(chat_id, content, reply_to=reply_to, metadata=metadata)
+        return await orig(self_feishu, chat_id, content, reply_to=reply_to, metadata=metadata,
+                          max_retries=max_retries, base_delay=base_delay)
+    return wrapper
+
+
+def _wrap_feishu_delivery_process(orig: Callable) -> Callable:
+    """Keep the real inbound turn ID even when replies share one topic root."""
+    @functools.wraps(orig)
+    async def wrapper(self_feishu, event, session_key):
+        from ..feishu.delivery import delivery_context
+        text = str(getattr(event, "text", "") or "").lstrip()
+        prefix = getattr(self_feishu, "typed_command_prefix", None) or "!"
+        token = delivery_context.set({
+            "event_ref": str(getattr(event, "message_id", "") or ""),
+            "session_key": session_key,
+            "ephemeral": text.startswith(("/", prefix)),
+        })
+        try:
+            return await orig(self_feishu, event, session_key)
+        finally:
+            delivery_context.reset(token)
+    return wrapper
+
+
+def _wrap_feishu_delivery_connect(orig: Callable) -> Callable:
+    @functools.wraps(orig)
+    async def wrapper(self_feishu, *args, **kwargs):
+        result = await orig(self_feishu, *args, **kwargs)
+        if result and _get_config().verified_final_delivery:
+            from ..feishu.delivery import get_delivery
+            try:
+                get_delivery(self_feishu).start()
+            except Exception as exc:
+                _logger.error("HLS delivery recovery unavailable at connect: %s", type(exc).__name__)
+        return result
+    return wrapper
+
+
+def _wrap_feishu_delivery_disconnect(orig: Callable) -> Callable:
+    @functools.wraps(orig)
+    async def wrapper(self_feishu, *args, **kwargs):
+        sender = getattr(self_feishu, "_hls_verified_delivery", None)
+        try:
+            if sender is not None:
+                await sender.stop()
+        finally:
+            result = await orig(self_feishu, *args, **kwargs)
+        return result
+    return wrapper
+
+
+def _wrap_feishu_native_send_retry(orig: Callable) -> Callable:
+    """Reject a failed chunk before native send() can hide it behind a later ACK."""
+    @functools.wraps(orig)
+    async def wrapper(self_feishu, *args, **kwargs):
+        response = await orig(self_feishu, *args, **kwargs)
+        if _get_config().independent_final_delivery and not self_feishu._response_succeeded(response):
+            from ..feishu.client import FeishuAPIError, _sanitize_message
+            code = getattr(response, "code", 0) or 0
+            detail = _sanitize_message(str(getattr(response, "msg", "no response")))[:300]
+            # Preserve invalid-post wording so native post->text fallback works.
+            raise FeishuAPIError(f"native message part rejected: code={code}, msg={detail}", code=code)
+        return response
+    return wrapper
+
 
 def _register_gateway_card(card_msg_id: str, *, chat_id: str, card_id: str | None, category: str) -> None:
     """Register a gateway card so edit_message can update it later."""

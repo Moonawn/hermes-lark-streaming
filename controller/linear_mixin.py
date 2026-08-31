@@ -27,6 +27,7 @@ from ..cardkit import (
 from ..cardkit.i18n import _T, _i18n
 from ..cardkit.md import _downgrade_tables, escape_markdown_asterisks, optimize_markdown_style
 from ..state.linear import UnifiedLinearState
+from ..state.writer import serialized_card_write
 from ..state.text import split_reasoning_text
 from ..feishu import (
     CARDKIT_SCHEMA_ERROR,
@@ -104,6 +105,24 @@ def _answer_fast_stream_sec(cfg: Any) -> float:
     except Exception:
         return 0.150
 
+
+def _card_answer_snapshot(state: UnifiedLinearState, cfg: Any) -> tuple[int, str]:
+    revision, content = state.answer_snapshot()
+    if getattr(cfg, "compact_progress_card", False):
+        content = "✍️ 正在生成答复 · Writing…"
+    return revision, content or " "
+
+
+def _final_card_answer(state: UnifiedLinearState, cfg: Any, *, is_error=False, is_aborted=False) -> str:
+    if getattr(cfg, "compact_progress_card", False):
+        if is_aborted:
+            return "已停止 · Stopped"
+        if is_error:
+            return "处理异常 · Processing error"
+        # This is a generation status, deliberately not a delivery receipt.
+        return "处理结束 · Processing finished"
+    return escape_markdown_asterisks(_downgrade_tables(optimize_markdown_style(state.answer_text))) or " "
+
 class UnifiedControllerMixin:
     """Unified panel linear mode — phased card lifecycle."""
 
@@ -115,6 +134,7 @@ class UnifiedControllerMixin:
     _cleanup: Callable[[str], None]
     _flush_deferred_background_reviews: Callable[[CardSession], None]
 
+    @serialized_card_write
     async def _do_create_linear_card(self, session: CardSession) -> None:
         """Create the initial placeholder card — loading hint only, no panel."""
         if session.state != IDLE:
@@ -202,11 +222,12 @@ class UnifiedControllerMixin:
                     session.guard.terminate("_do_create_linear_card", err=e)
                 except Exception:
                     _logger.debug("guard.terminate failed in create path", exc_info=True)
-            session.state = CREATION_FAILED
-            session.enter_terminal(
-                reason=TerminalReason.CREATION_FAILED,
-                source="_do_create_linear_card",
-            )
+            if not session.is_terminal_phase:
+                session.state = CREATION_FAILED
+                session.enter_terminal(
+                    reason=TerminalReason.CREATION_FAILED,
+                    source="_do_create_linear_card",
+                )
             # Signal readiness even on failure so awaiters don't deadlock
             session._card_ready.set()
 
@@ -249,6 +270,7 @@ class UnifiedControllerMixin:
 
         session.flush.schedule_update(lambda: self._do_unified_flush(session))
 
+    @serialized_card_write
     async def _do_unified_flush(self, session: CardSession) -> None:
         """Unified panel flush — max 2 API calls per flush cycle."""
         if session.is_terminal_phase or session.state == COMPLETING:
@@ -408,13 +430,13 @@ class UnifiedControllerMixin:
             # v1.7.0 (R2-01): escaped_answer_view caches the escape incrementally
             # (was: full-text escape on every flush).
             if state.answer_dirty:
-                content = state.escaped_answer_view() or " "
+                revision, content = _card_answer_snapshot(state, self._cfg)
                 session.sequence += 1
                 try:
                     await self._client.cardkit_stream_element(
                         session.card_id, ANSWER_ELEMENT_ID, content, sequence=session.sequence,
                     )
-                    state.answer_dirty = False
+                    state.acknowledge_answer(revision)
                 except FeishuAPIError as e:
                     if e.code == CARDKIT_STREAMING_CLOSED:
                         session._streaming_closed = True
@@ -544,13 +566,13 @@ class UnifiedControllerMixin:
         # Note: skip markdown optimization during streaming for performance;
         if state.answer_dirty and "answer" in session._creation_stages:
             # v1.7.0 (R2-01): incremental escape cache (was full-text escape).
-            content = state.escaped_answer_view() or " "
+            revision, content = _card_answer_snapshot(state, self._cfg)
             session.sequence += 1
             try:
                 await self._client.cardkit_stream_element(
                     session.card_id, ANSWER_ELEMENT_ID, content, sequence=session.sequence,
                 )
-                state.answer_dirty = False
+                state.acknowledge_answer(revision)
             except FeishuAPIError as e:
                 if e.code == CARDKIT_STREAMING_CLOSED:
                     if session._streaming_closed_logged:
@@ -607,6 +629,7 @@ class UnifiedControllerMixin:
         if (reasoning and self._cfg.show_reasoning and not _reasoning_already_tracked) or answer:
             self._schedule_linear_flush(session)
 
+    @serialized_card_write
     async def _preservative_seal(
         self,
         session: CardSession,
@@ -680,7 +703,7 @@ class UnifiedControllerMixin:
                 # ── Flush remaining answer text ──
                 if state.answer_dirty and "answer" in session._creation_stages and not session._streaming_closed:
                     # v1.7.0 (R2-01): incremental escape cache (was full-text escape).
-                    content = state.escaped_answer_view() or " "
+                    revision, content = _card_answer_snapshot(state, self._cfg)
                     try:
                         session.sequence += 1
                         _logger.info(
@@ -691,7 +714,7 @@ class UnifiedControllerMixin:
                             session.card_id, ANSWER_ELEMENT_ID, content,
                             sequence=session.sequence,
                         )
-                        state.answer_dirty = False
+                        state.acknowledge_answer(revision)
                     except FeishuAPIError as e:
                         # v1.1.1: 统一 fallback — 300309 和 300313 都改用 batch_update（不带 tag）
                         if e.code == CARDKIT_STREAMING_CLOSED or is_element_not_found_error(e):
@@ -703,13 +726,14 @@ class UnifiedControllerMixin:
                                 card_id[:12],
                             )
                             session.sequence += 1
-                            await _fallback_write_answer(
+                            answer_ok = await _fallback_write_answer(
                                 self._client, session.card_id, content,
                                 sequence=session.sequence,
                             )
+                            if answer_ok:
+                                state.acknowledge_answer(revision)
                         else:
                             _logger.warning("HLS: seal drain answer failed: %s", e)
-                        state.answer_dirty = False
 
             # ── Step 1: Update unified panel to final state (non-streaming) ──
             seal_actions: list[dict[str, Any]] = []
@@ -746,7 +770,7 @@ class UnifiedControllerMixin:
             # v1.3.1 fix: Do NOT skip this step even when the answer was already fully
             # guard) is a minor visual issue; content truncation is a P0 data-loss bug.
             if state is not None and state.answer_text and "answer" in session._creation_stages:
-                optimized_content = escape_markdown_asterisks(_downgrade_tables(optimize_markdown_style(state.answer_text))) or " "
+                optimized_content = _final_card_answer(state, self._cfg, is_error=is_error, is_aborted=is_aborted)
                 seal_actions.append({
                     "action": "partial_update_element",
                     "params": {
@@ -880,6 +904,8 @@ class UnifiedControllerMixin:
             # CRITICAL: Only call close_streaming ONCE per card lifecycle.
             # updated to config.summary.content.  The summary MUST be
             seal_summary = _build_seal_summary(state)
+            if state is not None and self._cfg.compact_progress_card:
+                seal_summary = _final_card_answer(state, self._cfg, is_error=is_error, is_aborted=is_aborted)
 
             if not session._streaming_closed:
                 session.sequence += 1
@@ -957,7 +983,7 @@ class UnifiedControllerMixin:
                             # v1.3.1: same fix as main seal path — always send final
                             # (see v1.3.1 fix comment in main seal path above).
                             if state.answer_text and "answer" in session._creation_stages:
-                                optimized_content = escape_markdown_asterisks(_downgrade_tables(optimize_markdown_style(state.answer_text))) or " "
+                                optimized_content = _final_card_answer(state, self._cfg, is_error=is_error, is_aborted=is_aborted)
                                 retry_actions.append({
                                     "action": "partial_update_element",
                                     "params": {
@@ -991,6 +1017,8 @@ class UnifiedControllerMixin:
                         if not session._streaming_closed:
                             # Recompute seal_summary for retry (state may have changed)
                             retry_summary = _build_seal_summary(state)
+                            if state is not None and self._cfg.compact_progress_card:
+                                retry_summary = _final_card_answer(state, self._cfg, is_error=is_error, is_aborted=is_aborted)
                             session.sequence += 1
                             await self._client.cardkit_close_streaming(
                                 card_id, sequence=session.sequence, summary=retry_summary,
@@ -1039,6 +1067,18 @@ class UnifiedControllerMixin:
 
         # ── Step 1: Wait for any in-progress flush to finish ──
         await session.flush.wait_for_flush()
+
+        # Creation also uses the writer. Wait outside the lock or a quick final
+        # can deadlock behind the very creation whose readiness it is awaiting.
+        if not session.card_id and not session._card_ready.is_set():
+            await session._card_ready.wait()
+        async with session.writer.writing():
+            return await self._finish_linear_card(session)
+
+    async def _finish_linear_card(self, session: CardSession) -> bool:
+        """Drain and seal while holding the same writer as create and flush."""
+        if session.guard.should_skip("_finish_linear_card"):
+            return False
 
         # without being flushed.  We must drain it ALL here, before
         # the "footer appears before content finishes" bug.
@@ -1113,7 +1153,7 @@ class UnifiedControllerMixin:
             # ── Drain answer text ──
             if state.answer_dirty and "answer" in session._creation_stages:
                 # v1.7.0 (R2-01): incremental escape cache (was full-text escape).
-                content = state.escaped_answer_view() or " "
+                revision, content = _card_answer_snapshot(state, self._cfg)
                 try:
                     session.sequence += 1
                     _logger.info(
@@ -1124,7 +1164,7 @@ class UnifiedControllerMixin:
                         session.card_id, ANSWER_ELEMENT_ID, content,
                         sequence=session.sequence,
                     )
-                    state.answer_dirty = False
+                    state.acknowledge_answer(revision)
                 except FeishuAPIError as e:
                     # v1.1.1: 统一 fallback — 300309 和 300313 都改用 batch_update（不带 tag）
                     # 之前 300309 直接 skip 答案丢失；300313 的 fallback 带 tag 报 300312
@@ -1148,7 +1188,7 @@ class UnifiedControllerMixin:
                             sequence=session.sequence,
                         )
                         if ok:
-                            state.answer_dirty = False
+                            state.acknowledge_answer(revision)
                     else:
                         _logger.warning("HLS: drain answer failed: %s", e)
 
@@ -1176,11 +1216,6 @@ class UnifiedControllerMixin:
 
         # ── Step 3: Mark flush as completed — no more updates accepted ──
         session.flush.mark_completed()
-
-        try:
-            await asyncio.wait_for(session._card_ready.wait(), timeout=30.0)
-        except asyncio.TimeoutError:
-            _logger.warning("complete: card creation timed out: msg=%s", (session.message_id or "?")[:12])
 
         if not session.card_id:
             session.state = CREATION_FAILED
@@ -1221,6 +1256,18 @@ class UnifiedControllerMixin:
         )
 
         if seal_ok:
+            # A sealed loading-only card is not a delivered answer. In legacy
+            # mode wait for the lossless fallback ACK before recording success;
+            # separate-message mode leaves this exclusively to the gateway.
+            if (
+                state is not None
+                and state.answer_text
+                and "answer" not in session._creation_stages
+                and not self._cfg.independent_final_delivery
+            ):
+                _logger.warning("answer element missing; using full text fallback msg=%s", (session.message_id or "?")[:12])
+                if not await self._send_text_fallback(session, fallback_text=state.answer_text):
+                    return False
             # v1.3.4 fix (P1): 如果会话已被 on_aborted 标记为 ABORTED，
             if session._was_aborted:
                 session.state = ABORTED
@@ -1237,37 +1284,18 @@ class UnifiedControllerMixin:
                     reason=TerminalReason.NORMAL,
                     source="_do_linear_complete",
                 )
-            # v1.7.0 (R1-03): if the answer element was never created (Phase 2
-            # SCHEMA ERROR mid-stream), the card shows no answer at all —
-            # snapshot the text BEFORE releasing state and deliver it as a
-            # plain text reply so the user still gets the response.
-            _lost_answer = ""
-            if (
-                state is not None
-                and state.answer_text
-                and "answer" not in session._creation_stages
-            ):
-                _lost_answer = state.answer_text
+                if session.card_msg_id and session.unified_state is not None:
+                    from ..patching.adapter import _register_card_reply_context
+                    _register_card_reply_context(
+                        session.card_msg_id,
+                        session.final_answer or session.unified_state.answer_text,
+                    )
             # v1.1.1: 释放重数据（unified_state/text/tool_use），减少内存占用
             # session 留最小元数据等 _prune_stale_sessions 清理
             try:
                 self._release_session_data(session)
             except Exception:
                 _logger.debug("HLS: release session data failed", exc_info=True)
-            if _lost_answer:
-                _logger.warning(
-                    "linear complete: answer element never created (schema "
-                    "error?) — delivering answer via text fallback msg=%s len=%d",
-                    (session.message_id or "?")[:12], len(_lost_answer),
-                )
-                try:
-                    await self._send_text_fallback(session, fallback_text=_lost_answer)
-                except Exception:
-                    _logger.warning(
-                        "linear complete: lost-answer text fallback failed msg=%s",
-                        (session.message_id or "?")[:12],
-                        exc_info=True,
-                    )
             # v1.1.0: Record metrics
             try:
                 from ..aowen import record_card_completed
