@@ -1,5 +1,7 @@
 # 🧠 hermes-lark-streaming — LLM 快速上手指南
 
+> **Moonawn fork 提示**：本文件保留上游架构参考。当前 fork 的安装、升级、交付模式和隐私边界以 [AGENT_GUIDE.md](AGENT_GUIDE.md) 与 [MAINTENANCE.md](MAINTENANCE.md) 为准；旧文档中的上游发布渠道不用于更新本 fork。
+
 > **Purpose**: 项目技能卡片。阅读后应能理解架构、关键设计决策，并高效修改代码。
 
 ---

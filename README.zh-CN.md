@@ -1,244 +1,57 @@
-<h1 align="center">hermes-lark-streaming</h1>
+# Hermes Lark Streaming — Moonawn 维护版
 
-<p align="center">
-  <img src="https://img.shields.io/badge/项目-Vibe%20Coding-ff69b4" alt="Vibe Coding">
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-4caf50.svg" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/python-3.11+-3776AB.svg" alt="Python 3.11+">
-  <img src="https://img.shields.io/badge/version-1.7.0-ff9800.svg" alt="Version">
-</p>
+[English](README.md) · [维护与部署](docs/MAINTENANCE.md) · [MIT 许可证](LICENSE)
 
-<p align="center">
-<a href="mailto:zhengyu.pu@petalmail.com"><img src="https://img.shields.io/badge/邮箱-zhengyu.pu%40petalmail.com-9C27B0?logo=gmail&logoColor=white" alt="邮箱"></a>
-<a href="https://applink.feishu.cn/client/message/link/open?token=AmoQJk5dwczIahKlW78ADLU%3D"><img src="https://img.shields.io/badge/官方唯一交流群-中国-red" alt="官方交流群"></a>
-<a href="https://larkcommunity.feishu.cn/wiki/DKkpwgMcJiglIhk88N4cqJEan5f?from=from_copylink"><img src="https://img.shields.io/badge/docs-知识库-3370FF?logo=feishu&logoColor=white" alt="知识库文档"></a>
-</p>
+这是 [Aowen-Nowor/hermes-lark-streaming](https://github.com/Aowen-Nowor/hermes-lark-streaming) 的独立 fork，基于上游 **v1.7.0 / `aef71a8`**。上游亦基于 [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming) 发展而来，原有署名与 MIT 许可证保留。此项目是 Hermes 插件，不是 Codex 插件。
 
-<p align="center">
-<a href="README.md">English</a> | 中文版
-</p>
+**当前是开发候选 `1.7.0+moonawn.1`，尚未宣称生产验证或发布稳定版。** 维护重点是终稿完整送达、流式任务可靠收尾，以及更安静、易读的展示。
 
-为 Hermes Agent 提供飞书/Lark CardKit v2.0 流式消息卡片插件 — 实时 AI 响应展示，支持打字机效果、统一可折叠面板、按时间线交错显示推理与工具调用等。
+## 已加入的修正
 
-> 基于 [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming) v0.7.0 版本 fork 后进行改造和优化
->
-> ⚠️ **与上游插件不兼容** — 如已安装原版 `Cheerwhy/hermes-lark-streaming`，请先卸载后再安装本插件。
+- **终稿权威性**：最终回答可以比过程文本短；较长的过渡语不再覆盖较短终稿。相同消息的不同终稿阶段交回 gateway 发送。
+- **更新顺序**：同一卡片的创建、刷新、收尾共用一个 writer；旧 ACK 不会清掉新内容的待刷新标记。
+- **超时与取消**：所有聊天都受收尾时限保护；取消释放等待者、结束生命周期，过期的收尾任务可以回收。失败卡片会尝试停止服务端打字动画，此动作也有时限。
+- **无损兜底**：按片段发送完整正文，保留分隔符；重试复用同一轮、同一片段的 UUID，不再只截取开头。
+- **独立答复**：可将过程卡和最终消息分开。卡片存在不代表正文已送达，前一片段失败也不会被后一片段的成功掩盖。
+- **紧凑显示**：可只保留短状态与可折叠工具过程，完整正文放在独立答复里，减少长卡片跳动。
+- **实验性回读校验**：原生 Feishu adapter 可先保存终稿和待发送载荷，再逐条回读消息正文；异常恢复使用已保存内容，不重新调用模型。
+- **可选群内队列**：按明确配置的群串行处理，保留独立入站消息，检查排队期间被撤回的消息；默认不改变群的并发策略。
 
----
+保留上游 v1.7.0 的 relay 支持、schema 错误恢复、Markdown 缓存与面板记录上限。
 
-## 效果预览
+## 展示选择
 
-<table align="center">
-  <tr>
-    <td><img src="assets/screenshots/img1.png" width="200px" /></td>
-    <td><img src="assets/screenshots/img2.png" width="200px" /></td>
-    <td><img src="assets/screenshots/img3.png" width="200px" /></td>
-    <td><img src="assets/screenshots/img4.png" width="200px" /></td>
-  </tr>
-</table>
+| 模式 | 过程卡 | 最终正文 |
+| --- | --- | --- |
+| 默认兼容模式 | 完整流式正文和工具过程 | 原卡片，必要时文本兜底 |
+| 独立答复 + full | 保留流式正文预览 | 另发独立答复 |
+| 独立答复 + compact | 短状态、可折叠工具过程 | 另发独立答复，适合长文与多人群 |
 
----
+紧凑模式中的“处理结束”仅表示生成阶段结束，**不等于正文送达回执**。回读状态 `verified` 表示服务端正文与预期发送载荷一致，不代表用户已阅读，也不保证不同客户端的排版完全相同。
 
-## 快速开始
+将 [紧凑配置示例](examples/compact-progress.yaml) 合并到测试 Profile 的现有配置，不要整份覆盖。希望继续看正文流式预览时，把 `progress_card` 改成 `full`。回读校验另行显式启用，见 [示例](examples/verified-native-delivery.yaml) 与 [边界说明](docs/MAINTENANCE.md#verified-delivery)。
 
-### 前置要求
-
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent)（已运行，已配置飞书平台）
-- Hermes CLI 支持插件系统（可用 `hermes plugins` 命令）
-
-### 安装
-
-> **💡 智能安装提示**：将以下提示词复制给 Hermes Agent，它会自动完成安装：
-> 
-> ```
-> 帮我安装飞书敖式卡片：
-> - Gitee：https://gitee.com/Aowen-Nowor/hermes-lark-streaming/raw/github_sync/docs/AGENT_GUIDE.md
-> - GitHub：https://raw.githubusercontent.com/Aowen-Nowor/hermes-lark-streaming/github_sync/docs/AGENT_GUIDE.md
-> ```
-
-> 插件会自动读取 `HERMES_HOME` 环境变量定位安装路径（默认 `~/.hermes`），非默认路径下无需额外操作。
-
-**Gitee**
-> 以下两种方式任选其一即可：
-```bash
-# Gitee (SSH)
-hermes plugins install git@gitee.com:Aowen-Nowor/hermes-lark-streaming.git
-# Gitee (HTTPS)
-hermes plugins install https://gitee.com/Aowen-Nowor/hermes-lark-streaming
-```
-**GitHub**
-> 以下两种方式任选其一即可：
-```bash
-# GitHub (SSH)
-hermes plugins install git@github.com:Aowen-Nowor/hermes-lark-streaming.git
-# GitHub (HTTPS)
-hermes plugins install https://github.com/Aowen-Nowor/hermes-lark-streaming
-```
-
-提示时输入 `Y` 启用插件，然后重启网关：
+## 开发验证
 
 ```bash
-hermes gateway restart
+git clone https://github.com/Moonawn/hermes-lark-streaming.git
+cd hermes-lark-streaming
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-test.txt
+python scripts/test_offline.py tests -q
 ```
 
-### 更新
+CI 覆盖 Python 3.11–3.13。离线测试使用临时 `HERMES_HOME`，阻止 Python socket 网络访问。原生发送器兼容测试需要固定版本的 Hermes 源码：
 
 ```bash
-hermes plugins update hermes-lark-streaming
-hermes gateway restart
+HERMES_SRC_DIR=/path/to/hermes-source python scripts/test_offline.py \
+  tests/test_verified_delivery.py tests/test_final_delivery_local.py \
+  tests/test_delivery_reliability.py tests/test_task_group_queue.py tests/integration -q -rs
 ```
 
-### 卸载
+提供 `HERMES_SRC_DIR` 后，无法导入原生 adapter 会直接失败，不能靠跳过交付测试获得绿色结果。CI 没有飞书凭据，不发送通知、不发布版本、不部署，也不定时覆盖 fork。
 
-```bash
-# 1. 先清理注入的配置（插件代码还在时执行）
-# 自动检测 Hermes Python 路径：
-HERMES_PYTHON=$(python3 ~/.hermes/plugins/hermes-lark-streaming/__main__.py python)
-$HERMES_PYTHON ~/.hermes/plugins/hermes-lark-streaming/__main__.py cleanup
+先在新测试 Profile 使用审核过的 commit，具体步骤见 [部署指南](docs/AGENT_GUIDE.md)。不要同时加载本 fork 和同名上游插件。默认分支沿用 `github_sync` 名称，但已移除自动同步逻辑。
 
-# 2. 卸载插件
-hermes plugins uninstall hermes-lark-streaming
-
-# 3. 重启网关
-hermes gateway restart
-```
-
-### 验证安装
-
-```bash
-hermes plugins list
-grep hermes_lark_streaming ~/.hermes/logs/agent.log
-# 自动检测 Hermes Python 路径：
-HERMES_PYTHON=$(python3 ~/.hermes/plugins/hermes-lark-streaming/__main__.py python)
-$HERMES_PYTHON ~/.hermes/plugins/hermes-lark-streaming/__main__.py status
-$HERMES_PYTHON ~/.hermes/plugins/hermes-lark-streaming/__main__.py verify
-$HERMES_PYTHON ~/.hermes/plugins/hermes-lark-streaming/__main__.py doctor
-```
-
-> **排障提示**：安装后若无卡片效果，请检查：(1) `hermes plugins list` 显示插件已启用；(2) `~/.hermes/plugins/` 下无 `*.bak` 目录干扰；(3) 飞书凭据已配置（见[飞书凭据](#飞书凭据)）。`doctor` 命令可一键诊断插件版本、Python 环境、配置项、飞书凭据、补丁应用状态、日志路径。
-
----
-
-## 配置说明
-
-所有配置项位于 `~/.hermes/config.yaml` 的 `hermes_lark_streaming:` 节下。插件首次加载时自动注入默认配置；卸载前请先运行 `cleanup` 命令清除。
-
-```yaml
-hermes_lark_streaming:
-  panel_expanded: false            # 完成态卡片中面板是否保持展开
-  streaming_panel_expanded: false  # 流式态卡片中面板是否保持展开
-  print_strategy: delay            # "fast"（即时）或 "delay"（更丝滑打字机，默认）
-  print_step: 4                    # 打字机每次渲染字符数（默认4，范围1~10，需飞书7.23+）
-  flush_interval_ms: 200           # 插件发送间隔（毫秒，70~2000，默认200）
-  card_ttl_sec: 600               # 卡片存活检测超时（秒）
-  max_tool_steps: 20               # 统一面板最多显示的工具步骤数（默认20，范围1~100）
-  max_reasoning_rounds: 20         # 统一面板最多显示的推理轮次数（默认20，范围1~100）
-
-  footer:
-    show_label: false              # 是否显示字段标签
-    fields:
-      - [status, elapsed, model, cost, compression_exhausted]
-      # 可用字段说明：
-      #   status      — 回复状态（已完成 / 出错 / 已停止）
-      #   elapsed     — AI 回复耗时
-      #   model       — 使用的模型名称
-      #   cost        — 预估费用及可信度（$0.023 估算 / $0.023 实报 / 免费）
-      #   compression_exhausted — 上下文已满（⚠ 上下文已满）
-      # 以下字段默认不显示 — 在 fields 列表中添加即可启用：
-      #   cache       — 缓存命中率（缓存命中/总输入 命中率%）
-      #   tokens      — Token 用量（↑ 输入 ↓ 输出 💭 推理）
-      #   context     — 上下文窗口用量（已用/总量 百分比）
-      #   api_calls   — 本轮对话的 API 调用次数
-      #   history_offset — 对话历史偏移量；值越大对话越长，值突然变小说明发生了上下文压缩
-      # 每个内层列表为页脚的一行，字段仅在有值时显示
-```
-
-### 推理面板显示
-
-```yaml
-display:
-  show_reasoning: true  # 在统一面板中显示推理内容
-```
-
-### 统一面板超限压缩
-
-飞书卡片2.0 **硬性限制200个元素/组件**，超出会报错 `300305 (element exceeds the limit)`，导致卡片封口失败并触发文本兜底（内容重复）。
-
-> **元素计数规则**：每个带 `tag` 属性的 JSON 对象都算1个元素，包括嵌套在内层的 `standard_icon`、`plain_text`、`lark_md` 等。
-
-#### 统一面板各项元素消耗
-
-| 组成部分 | 元素数 | 说明 |
-|---------|--------|------|
-| 面板容器 | 1 | `collapsible_panel` |
-| 面板标题 | 2 | `plain_text` + `standard_icon` |
-| 每个推理轮次（最大） | 4 | 标题行 `div`+`standard_icon`+`lark_md` + 推理文本 `markdown` |
-| 每个工具步骤（最大） | 7 | 标题行 `div`+`standard_icon`+`lark_md` + 详情行 `div`+`plain_text` + 结果行 `div`+`lark_md` |
-| 折叠提示（触发时） | 1 | 1个 `markdown` 元素 |
-| 回答文本 | 1~3 | `markdown`，长文本会被拆分 |
-| 页脚 | 2 | `hr` + `markdown` |
-| 卡片头（启用时） | ~3 | `plain_text` + `standard_icon` |
-| 错误面板（有时） | ~4 | `collapsible_panel` + 内部元素 |
-
-**计算示例**：20 轮推理 + 20 步工具 = 20×4 + 20×7 + 固定开销 ≈ 223（超过 200）
-
-因此默认值设为 `max_tool_steps=20` + `max_reasoning_rounds=20`，配合折叠机制确保大多数场景不超限。即使配置值较高或极端情况下元素仍超限，代码内置了**卡片级元素安全网**——封卡时已知全部元素（面板+answer+footer+error），递归计算实际 tag objects 总数，超过195（200-5缓冲）时自动从面板children最老项目开始裁剪，确保卡片元素永远不会超过200。answer、footer、error panel 永不裁剪。
-
-#### 配置项
-
-```yaml
-hermes_lark_streaming:
-  max_tool_steps: 20           # 统一面板最多显示的工具步骤数（默认20，范围1~100）
-  max_reasoning_rounds: 20     # 统一面板最多显示的推理轮次数（默认20，范围1~100）
-```
-
-超出限制时，早期项目会被折叠为一行提示，例如：`⚡ 还有 10 轮早期推理、5 步早期操作已折叠`
-
-面板标题始终显示**实际总数**（如"3轮 · 44个工具"），折叠提示仅影响面板内展示的内容。
-
-### /aowen 命令
-
-在飞书中发送 `/aowen` 系列命令，插件直接回复卡片（不经过 Hermes AI）：
-
-| 命令 | 说明 |
-|------|------|
-| `/aowen help` | 显示所有命令列表 |
-| `/aowen status` | 查看插件状态 + 当前配置（折叠面板展示） |
-| `/aowen monitor` | 查看监控面板（卡片创建数、API 调用数、错误码分布等） |
-| `/aowen monitor reset` | 重置监控统计计数器 |
-| `/aowen config reload` | 修改 `~/.hermes/config.yaml` 后，在飞书中发送此命令立即生效，或重启网关生效 |
-| `/aowen` | 同 `/aowen help` |
-
-> `/aowen` 是插件的命令前缀，所有 `/aowen` 开头的命令都由插件处理，不经过 Hermes。
-
-### 飞书凭据
-
-插件复用 Hermes 已配置的飞书凭据，无需单独配置。Hermes 安装时已在 `~/.hermes/.env` 中配置：
-
-```bash
-# ~/.hermes/.env（Hermes 安装时已配置，插件直接复用）
-FEISHU_APP_ID=cli_xxxxxx
-FEISHU_APP_SECRET=xxxxxx
-FEISHU_DOMAIN=feishu          # feishu=国内版, lark=国际版
-```
-
-> 插件自动读取 Hermes 的飞书凭据和域名配置。如果 Hermes 飞书渠道能正常工作，插件也能正常工作。
-
----
-
-## 开发者指南与更新日志
-
-> 📖 **[SKILL.md](docs/SKILL.md)** — LLM 快速上手指南。项目架构、关键设计决策、高效代码修改指南。
-
-> 完整版本历史请查看 [CHANGELOG.md](docs/CHANGELOG.md)
-
-> ⚠️ **重要提醒：** 如从 v1.0.1 及以下版本升级，请按照卸载流程卸载老版本，重新安装新版本，禁止通过更新方式升级！
-
----
-
-## 如何提交 ISSUES
-> 请查看模板 [ISSUES_TEMPLATE.md](docs/ISSUES_TEMPLATE.md)
----
-
-## 致谢
-
-<a href="https://github.com/joshcheng820222"><img src="https://avatars.githubusercontent.com/u/26886147?v=4&s=66" alt="joshcheng820222" width="66" height="66"></a> <a href="https://github.com/xuu1998"><img src="https://avatars.githubusercontent.com/u/40609659?v=4&s=66" alt="xuu1998" width="66" height="66"></a> <a href="https://gitee.com/joshchengjoshcheng"><img src="assets/avatars/joshchengjoshcheng.png" alt="joshchengjoshcheng" width="66" height="66"></a> <a href="https://github.com/hmhmdcy"><img src="https://avatars.githubusercontent.com/u/163143682?v=4" alt="hmhmdcy" width="66" height="66"></a>
+本 fork 的问题与改进请提交到 [自己的 Issue/PR 区](https://github.com/Moonawn/hermes-lark-streaming/issues)。不要上传真实凭据、群与消息 ID、Profile、原始日志或交付数据库。未标注为 fork 文档的旧 `docs/` 内容保留作上游历史参考。

@@ -1,0 +1,64 @@
+name: Offline checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -r requirements-test.txt
+      - run: python scripts/test_offline.py tests -q -rs
+
+  native-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        hermes:
+          - f80f453ae0679347e38abc917c7f94f717bf96c5 # v2026.8.13
+          - 7339f5f160db5c96657a3bab60151227cc61f66c # v2026.8.16.2
+          - 5fc308a70719a83cccdbba4c0e39c23f5a8239d5 # v2026.8.27
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes }}
+          path: .deps/hermes
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements-test.txt
+      - name: Verify native transport with a fake wire
+        env:
+          HERMES_SRC_DIR: ${{ github.workspace }}/.deps/hermes
+        run: >-
+          python scripts/test_offline.py
+          tests/test_verified_delivery.py tests/test_final_delivery_local.py
+          tests/test_delivery_reliability.py tests/test_task_group_queue.py
+          tests/integration -q -rs

@@ -1,0 +1,10 @@
+# Versions exercised by the offline and pinned-Hermes compatibility jobs.
+lark-oapi==1.7.3
+PyYAML==6.0.3
+pytest==9.1.1
+pytest-asyncio==1.4.0
+setuptools==84.0.0
+python-dotenv==1.2.3
+rich==15.0.0
+pydantic==2.13.5
+httpx==0.28.1

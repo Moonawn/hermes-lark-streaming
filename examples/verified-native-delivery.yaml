@@ -1,0 +1,9 @@
+# Experimental: native FeishuAdapter only, NOT relay.
+# Merge after the base separate-message mode has passed canary validation.
+# Requires message-send/read permissions and a private, persistent HERMES_HOME.
+hermes_lark_streaming:
+  final_delivery: separate_message
+  progress_card: compact
+  verified_delivery: true
+gateway:
+  delivery_ledger: false       # exactly one recovery sender, not two
