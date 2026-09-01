@@ -2,18 +2,19 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
-
 from hermes_lark_streaming.config import Config
 from hermes_lark_streaming.controller import CardSession, StreamCardController
-from hermes_lark_streaming.patching.gateway import (
-    _wrap_deliver_queued_first_response,
-    _waiting_message_is_available,
-    _wrap_handle_message,
-)
 from hermes_lark_streaming.patching.adapter import (
     _wrap_feishu_adapter_dispatch_inbound,
+    _wrap_feishu_adapter_handle_message_with_guards,
+)
+from hermes_lark_streaming.patching.gateway import (
+    _waiting_message_is_available,
+    _wrap_deliver_queued_first_response,
+    _wrap_handle_message,
 )
 
 
@@ -159,6 +160,121 @@ async def test_serialized_chat_text_bypasses_feishu_aggregation() -> None:
     await wrapped(adapter, other_event)
 
     assert calls == ["direct:om_text", "batched:om_other"]
+
+
+@pytest.mark.asyncio
+async def test_reply_thread_is_normalized_before_native_routing_metadata() -> None:
+    """An ordinary reply must lose Feishu's synthetic thread_id before native handling."""
+    seen: dict[str, str | None] = {}
+
+    async def original(_adapter, event):
+        # Native Hermes derives its session key and delivery metadata here.
+        seen["thread_id"] = event.source.thread_id
+        return "handled"
+
+    event = SimpleNamespace(
+        message_id="om_reply",
+        source=SimpleNamespace(
+            platform=SimpleNamespace(value="feishu"),
+            chat_id="oc_chat",
+            thread_id="om_synthetic_root",
+        ),
+        reply_to_message_id="om_parent",
+        raw_message={"event": {"message": {"parent_id": "om_parent"}}},
+    )
+
+    controller = SimpleNamespace(enabled=True)
+    wrapped = _wrap_feishu_adapter_handle_message_with_guards(original)
+
+    with patch(
+        "hermes_lark_streaming.patching.hooks.get_controller",
+        return_value=controller,
+    ):
+        result = await wrapped(SimpleNamespace(), event)
+
+    assert result == "handled"
+    assert seen["thread_id"] is None
+    assert event.source.thread_id is None
+
+
+@pytest.mark.asyncio
+async def test_real_feishu_thread_is_preserved_before_native_routing() -> None:
+    """A raw thread_id identifies a genuine topic and must remain routed in-thread."""
+    seen: dict[str, str | None] = {}
+
+    async def original(_adapter, event):
+        seen["thread_id"] = event.source.thread_id
+
+    event = SimpleNamespace(
+        message_id="om_topic_reply",
+        source=SimpleNamespace(
+            platform=SimpleNamespace(value="feishu"),
+            chat_id="oc_chat",
+            thread_id="omt_real",
+        ),
+        reply_to_message_id="om_topic_parent",
+        raw_message={
+            "event": {
+                "message": {
+                    "parent_id": "om_topic_parent",
+                    "thread_id": "omt_real",
+                }
+            }
+        },
+    )
+
+    controller = SimpleNamespace(enabled=True)
+    wrapped = _wrap_feishu_adapter_handle_message_with_guards(original)
+
+    with patch(
+        "hermes_lark_streaming.patching.hooks.get_controller",
+        return_value=controller,
+    ):
+        await wrapped(SimpleNamespace(), event)
+
+    assert seen["thread_id"] == "omt_real"
+    assert event.source.thread_id == "omt_real"
+
+
+@pytest.mark.asyncio
+async def test_adapter_patch_installs_pre_routing_normalization() -> None:
+    """The production class patch must install the early-routing wrapper."""
+    from hermes_lark_streaming.patching import (
+        _apply_feishu_adapter_patches,
+        _patched_feishu_classes,
+    )
+
+    seen: dict[str, str | None] = {}
+
+    class Adapter:
+        async def send(self, *_args, **_kwargs):
+            return None
+
+        async def _handle_message_with_guards(self, event):
+            seen["thread_id"] = event.source.thread_id
+
+    event = SimpleNamespace(
+        message_id="om_reply",
+        source=SimpleNamespace(
+            platform=SimpleNamespace(value="feishu"),
+            chat_id="oc_chat",
+            thread_id="om_synthetic_root",
+        ),
+        reply_to_message_id="om_parent",
+        raw_message={"event": {"message": {"parent_id": "om_parent"}}},
+    )
+
+    try:
+        assert _apply_feishu_adapter_patches(Adapter) is True
+        with patch(
+            "hermes_lark_streaming.patching.hooks.get_controller",
+            return_value=SimpleNamespace(enabled=True),
+        ):
+            await Adapter()._handle_message_with_guards(event)
+    finally:
+        _patched_feishu_classes.discard(id(Adapter))
+
+    assert seen["thread_id"] is None
 
 
 @pytest.mark.asyncio

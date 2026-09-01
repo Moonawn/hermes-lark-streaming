@@ -1,3 +1,9 @@
+## 1.7.0+moonawn.2 (unreleased fork candidate)
+
+- 在 FeishuAdapter 进入原生 message guard 前归一化引用回复路由，避免普通 reply 的伪 `thread_id` 污染 session key 与最终投递 metadata；保留服务端回读 guard 对错 thread 的 fail-closed 拦截。
+- 对 Hermes 压缩模块增加 feature-detected 兼容保护：仅当本次 `CompressionCommitFence` 已取消时抑制迟到的成功提示，正常 compaction 完成提示不受影响。
+- 新增普通 reply、真实 thread、实际 class patch 安装和压缩 timeout fence 的回归测试。
+
 ## 1.7.0+moonawn.1 (unreleased fork candidate)
 
 基于上游 v1.7.0，保留 MIT 与原有署名。新增终稿权威替换、不同 final 阶段交回 gateway、无损分段兜底、每卡单 writer、revision ACK、全局收尾超时和取消清理。合入独立答复、实验性原生发送回读 outbox、启动兼容与可选群队列；新增紧凑过程卡。已移除定时 Gitee 强制同步、自动发布和群通知 workflow，改为固定版本离线 CI。部署边界与候选版本验收见 `MAINTENANCE.md`；尚未声明生产验证。

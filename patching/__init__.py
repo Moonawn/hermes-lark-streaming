@@ -40,6 +40,7 @@ __all__ = [
     '_get_event_message_id',
     '_get_thread_local_ctx',
     '_apply_gateway_runner_patches',
+    'apply_compression_status_patch',
     'apply_patches',
         '_apply_direct_agent_patch',
     # FeishuAdapter patch helpers
@@ -60,6 +61,7 @@ __all__ = [
     '_maybe_wrap_callbacks',
     # From adapter
     '_wrap_feishu_adapter_dispatch_inbound',
+    '_wrap_feishu_adapter_handle_message_with_guards',
     '_classify_gateway_message',
     '_wrap_feishu_adapter_send',
     '_wrap_feishu_adapter_fetch_message_text',
@@ -185,8 +187,10 @@ from .gateway import (  # noqa: E402
 from .callbacks import (  # noqa: E402
     _maybe_wrap_callbacks,
 )
+from .compression import apply_compression_status_patch  # noqa: E402
 from .adapter import (  # noqa: E402
     _wrap_feishu_adapter_dispatch_inbound,
+    _wrap_feishu_adapter_handle_message_with_guards,
     _classify_gateway_message,
     _wrap_feishu_adapter_send,
     _wrap_feishu_native_send_retry,
@@ -397,6 +401,13 @@ def apply_patches() -> None:
 
     _apply_direct_agent_patch()
 
+    compression_status_patched = apply_compression_status_patch()
+    if not compression_status_patched:
+        _logger.info(
+            "hermes-lark-streaming: Hermes cancelled-compaction status guard "
+            "not available for this version"
+        )
+
     cron_patched = False
     if compat.has_cron_scheduler:
         try:
@@ -454,6 +465,7 @@ def apply_patches() -> None:
         "version": __version__,
         "gateway_runner": "✓" if gw_patched else ("pending" if gw_delayed else "✗"),
         "conversation_loop": "✓" if _module_patch_applied else "n/a (direct AIAgent)",
+        "compression_status": "✓" if compression_status_patched else "n/a",
         "aiagent_direct": "applied",
         "cron_scheduler": "✓" if cron_patched else "n/a",
         "background_task": "✓" if gw_patched else ("pending" if gw_delayed else "n/a"),
@@ -464,10 +476,11 @@ def apply_patches() -> None:
     }
     _logger.info(
         "HLS: patch summary v%s — GatewayRunner=%s conversation_loop=%s "
-        "AIAgent=applied cron=%s background=%s FeishuAdapter=%s create_adapter_hook=%s relay=%s layout=%s",
+        "AIAgent=applied compression_status=%s cron=%s background=%s FeishuAdapter=%s create_adapter_hook=%s relay=%s layout=%s",
         __version__,
         _patch_status["gateway_runner"],
         _patch_status["conversation_loop"],
+        _patch_status["compression_status"],
         _patch_status["cron_scheduler"],
         _patch_status["background_task"],
         _patch_status["feishu_adapter"],
@@ -494,6 +507,17 @@ def _apply_feishu_adapter_patches(FeishuAdapter, *, is_repatch: bool = False) ->
         return True
 
     try:
+        try:
+            FeishuAdapter._handle_message_with_guards = (
+                _wrap_feishu_adapter_handle_message_with_guards(
+                    FeishuAdapter._handle_message_with_guards
+                )
+            )
+        except AttributeError:
+            _logger.debug(
+                "hermes-lark-streaming: FeishuAdapter._handle_message_with_guards "
+                "not found, pre-routing reply normalization skipped"
+            )
         try:
             FeishuAdapter._dispatch_inbound_event = _wrap_feishu_adapter_dispatch_inbound(
                 FeishuAdapter._dispatch_inbound_event

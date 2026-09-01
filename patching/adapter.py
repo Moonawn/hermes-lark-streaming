@@ -113,6 +113,44 @@ def _wrap_feishu_adapter_dispatch_inbound(orig_dispatch: Callable) -> Callable:
 
     return _intercepted_dispatch
 
+
+def _wrap_feishu_adapter_handle_message_with_guards(orig_handle: Callable) -> Callable:
+    """Normalize reply routing before Hermes derives session/delivery metadata.
+
+    Hermes builds the session key and ``_thread_metadata`` before the later
+    ``GatewayRunner._handle_message`` hook runs.  Feishu can populate
+    ``event.source.thread_id`` for an ordinary reply even though the raw event
+    has no real ``thread_id``.  Running the existing normalization here keeps
+    that synthetic value out of both the session key and verified-delivery
+    metadata while preserving genuine topic threads.
+    """
+
+    @functools.wraps(orig_handle)
+    async def _intercepted_handle(self_feishu, event, *args, **kwargs):
+        try:
+            from .hooks import on_feishu_normalize
+
+            source = getattr(event, "source", None)
+            if source is not None:
+                on_feishu_normalize(
+                    message_id=str(getattr(event, "message_id", "") or ""),
+                    source=source,
+                    event=event,
+                    reply_anchor_id=getattr(event, "reply_to_message_id", None),
+                )
+        except Exception:
+            # Routing normalization must never prevent the native adapter from
+            # handling an inbound event.  The verified sender remains the last
+            # line of defence if metadata is still inconsistent.
+            _logger.warning(
+                "HLS: pre-routing Feishu normalization failed",
+                exc_info=True,
+            )
+
+        return await orig_handle(self_feishu, event, *args, **kwargs)
+
+    return _intercepted_handle
+
 def _classify_gateway_message(content: str) -> str:
     """Classify a gateway-internal message by its content for card category."""
     if not isinstance(content, str):

@@ -4,7 +4,7 @@
 
 An independently maintained fork of [Aowen-Nowor/hermes-lark-streaming](https://github.com/Aowen-Nowor/hermes-lark-streaming), based on upstream **v1.7.0** (`aef71a8`). The upstream project in turn credits [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming). Original attribution and the MIT license are retained.
 
-**Development candidate: `1.7.0+moonawn.1`. No production rollout or stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a calmer reading experience. It is a Hermes plugin, not a Codex plugin.
+**Development candidate: `1.7.0+moonawn.2`. No production rollout or stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a calmer reading experience. It is a Hermes plugin, not a Codex plugin.
 
 ## What changes
 
@@ -16,6 +16,8 @@ An independently maintained fork of [Aowen-Nowor/hermes-lark-streaming](https://
 - Optional **compact progress cards** show status and collapsible tool activity; the full answer stays in a separate message.
 - Experimental native Feishu **verified delivery** stages the original final and planned payloads in a private SQLite outbox, validates the destination, and reads back every acknowledged message body. It resumes persisted work rather than rerunning the model.
 - Optional per-chat queues retain individual messages and check for withdrawn queued messages. No chat is serialized unless explicitly configured.
+- Feishu reply routing is normalized before Hermes derives the session and delivery metadata: a synthetic `thread_id` on an ordinary reply is removed, while a genuine topic thread is preserved.
+- A feature-detected compression guard suppresses Hermes' late “compaction complete” success message only when that attempt's commit fence was cancelled. Normal completion remains visible.
 
 Upstream v1.7.0's relay support, schema-error recovery, Markdown escape cache and bounded panel history remain in place.
 
