@@ -826,6 +826,104 @@ class TestDoUnifiedFlush:
         await ctrl._do_unified_flush(session)
 
 
+class TestElementLimitRecovery:
+    """300305 is permanent: preserve the answer and never retry-storm."""
+
+    @pytest.mark.asyncio
+    async def test_phase2_retries_once_without_panel(self) -> None:
+        ctrl = _setup_ctrl(linear=True)
+        session = _make_session("msg_limit_phase2", linear=True)
+        session.state = STREAMING
+        session.card_id = "card_limit_phase2"
+        session.existing_elements = {_LOADING_HINT_ELEMENT_ID, _LOADING_ELEMENT_ID}
+        session.unified_state.on_reasoning_delta("thinking")
+        session.unified_state.on_answer_delta("answer survives")
+        ctrl._sessions[session.message_id] = session
+
+        error = FeishuAPIError("element exceeds the limit", code=300305)
+        ctrl._client.cardkit_batch_update = AsyncMock(side_effect=[error, None])
+
+        await ctrl._do_unified_flush(session)
+
+        assert ctrl._client.cardkit_batch_update.await_count == 2
+        recovery_actions = ctrl._client.cardkit_batch_update.await_args_list[1].args[1]
+        added = [
+            element
+            for action in recovery_actions
+            if action.get("action") == "add_elements"
+            for element in action.get("params", {}).get("elements", [])
+        ]
+        assert [element.get("element_id") for element in added] == [ANSWER_ELEMENT_ID]
+        assert "answer" in session._creation_stages
+        assert "panel" not in session._creation_stages
+        assert "panel_overflow_suppressed" in session._creation_stages
+        ctrl._client.cardkit_stream_element.assert_awaited_once()
+        assert session.unified_state.answer_dirty is False
+
+    @pytest.mark.asyncio
+    async def test_phase3_suppresses_future_panel_retries_but_streams_answer(self) -> None:
+        ctrl = _setup_ctrl(linear=True)
+        session = _make_session("msg_limit_phase3", linear=True)
+        session.state = STREAMING
+        session.card_id = "card_limit_phase3"
+        session._creation_stages = {"answer", "panel", "hint_removed"}
+        session.existing_elements = {ANSWER_ELEMENT_ID, UNIFIED_PANEL_ELEMENT_ID}
+        session.unified_state.on_reasoning_delta("thinking")
+        session.unified_state.on_answer_delta("answer survives")
+        ctrl._sessions[session.message_id] = session
+
+        error = FeishuAPIError("element exceeds the limit", code=300305)
+        ctrl._client.cardkit_batch_update = AsyncMock(side_effect=error)
+
+        await ctrl._do_unified_flush(session)
+
+        assert ctrl._client.cardkit_batch_update.await_count == 1
+        assert "panel_overflow_suppressed" in session._creation_stages
+        assert session.unified_state.panel_dirty is False
+        assert session.unified_state.tool_steps_dirty is False
+        ctrl._client.cardkit_stream_element.assert_awaited_once()
+        assert session.unified_state.answer_dirty is False
+
+        session.unified_state.on_tool_event()
+        await ctrl._do_unified_flush(session)
+        assert ctrl._client.cardkit_batch_update.await_count == 1
+        assert session.unified_state.panel_dirty is False
+
+    @pytest.mark.asyncio
+    async def test_final_seal_retries_once_without_panel_or_footer(self) -> None:
+        ctrl = _setup_ctrl(linear=True)
+        session = _make_session("msg_limit_seal", linear=True)
+        session.state = STREAMING
+        session.card_id = "card_limit_seal"
+        session._creation_stages = {"answer", "panel", "hint_removed"}
+        session.existing_elements = {
+            ANSWER_ELEMENT_ID,
+            UNIFIED_PANEL_ELEMENT_ID,
+            _LOADING_ELEMENT_ID,
+        }
+        session.unified_state.on_answer_delta("authoritative final")
+        session.unified_state.answer_dirty = False
+        session.unified_state.panel_dirty = False
+        session.unified_state.tool_steps_dirty = False
+
+        error = FeishuAPIError("element exceeds the limit", code=300305)
+        ctrl._client.cardkit_batch_update = AsyncMock(side_effect=[error, None])
+
+        assert await ctrl._preservative_seal(session)
+
+        assert ctrl._client.cardkit_batch_update.await_count == 2
+        compact_actions = ctrl._client.cardkit_batch_update.await_args_list[1].args[1]
+        updated_ids = {
+            action.get("params", {}).get("element_id")
+            for action in compact_actions
+            if action.get("action") == "partial_update_element"
+        }
+        assert updated_ids == {ANSWER_ELEMENT_ID}
+        assert "panel_overflow_suppressed" in session._creation_stages
+        ctrl._client.cardkit_close_streaming.assert_awaited_once()
+        assert session._streaming_closed is True
+
+
 # ── Split/rollover tests — REMOVED in unified panel architecture ──
 
 

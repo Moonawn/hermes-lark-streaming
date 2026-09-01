@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -47,12 +48,24 @@ __all__ = [
     'build_panel_children',
     '_count_tag_objects',
     '_is_collapse_hint_child',
+    '_PANEL_ELEMENT_LIMIT',
+    '_PANEL_WIRE_BYTES_LIMIT',
 ]
 
 _IMG_MD_PATTERN = re.compile(r"!\[([^\]]*)\]\((img_[^)\s]+)\)")
 _RE_MULTI_NEWLINE = re.compile(r"\n{3,}")
 _RE_BACKTICK_RUN = re.compile(r"`+")
 _RE_MD_SPECIAL = re.compile(r"([`*_{}\[\]<>])")
+
+# A streaming card also contains the answer element and loading/footer
+# elements.  Keep the process panel comfortably below CardKit's 200-element
+# hard limit, and bound its serialized size so long tool output cannot crowd
+# out the authoritative answer.
+_PANEL_ELEMENT_LIMIT = 180
+_PANEL_WIRE_BYTES_LIMIT = 24_000
+_TOOL_TITLE_DISPLAY_LIMIT = 180
+_TOOL_DETAIL_DISPLAY_LIMIT = 500
+_TOOL_OUTPUT_DISPLAY_LIMIT = 1_600
 
 def _extract_images_from_markdown(text: str) -> tuple[str, list[dict]]:
     """提取飞书图片为独立 Card 2.0 img 元素，返回 (清理后的文本, img元素列表)."""
@@ -270,6 +283,112 @@ def _truncate_reasoning(text: str) -> str:
     truncated = text[:_REASONING_DISPLAY_LIMIT - len(suffix)] + suffix
     return truncated
 
+
+def _truncate_display_text(text: str, limit: int) -> str:
+    """Bound auxiliary panel text while preserving the original size hint."""
+    if len(text) <= limit:
+        return text
+    _, zh_suffix = _T["truncated_suffix"]
+    suffix = zh_suffix.format(len(text))
+    if len(suffix) >= limit:
+        return text[:limit]
+    return text[:limit - len(suffix)] + suffix
+
+
+def _panel_wire_bytes(panel: dict[str, Any]) -> int:
+    """Return the UTF-8 JSON size sent to CardKit for one panel."""
+    return len(
+        json.dumps(panel, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+
+
+def _panel_child_groups(children: list[dict]) -> tuple[dict | None, list[list[dict]]]:
+    """Group a title with its detail/output so trimming never leaves orphans."""
+    hint: dict | None = None
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    for child in children:
+        if _is_collapse_hint_child(child):
+            if hint is None:
+                hint = child
+            continue
+        is_title = (
+            isinstance(child, dict)
+            and child.get("tag") == "div"
+            and isinstance(child.get("icon"), dict)
+        )
+        if is_title:
+            if current:
+                groups.append(current)
+            current = [child]
+        elif current:
+            current.append(child)
+        else:
+            groups.append([child])
+    if current:
+        groups.append(current)
+    return hint, groups
+
+
+def _collapse_hint(existing_hint: dict | None, newly_trimmed: int) -> dict:
+    if existing_hint is not None and newly_trimmed == 0:
+        return existing_hint
+    if existing_hint is not None:
+        existing_zh = str(existing_hint.get("content", ""))
+        existing_i18n = existing_hint.get("i18n_content", {})
+        existing_en = str(existing_i18n.get("en_us", existing_zh))
+        en_extra, zh_extra = _T["collapse_extra"]
+        en_text = existing_en + en_extra.format(newly_trimmed)
+        zh_text = existing_zh + zh_extra.format(newly_trimmed)
+        return {
+            "tag": "markdown",
+            "content": zh_text,
+            "i18n_content": _i18n(en_text, zh_text),
+            "text_size": "notation",
+        }
+
+    total = newly_trimmed
+    en_template, zh_template = _T["collapse_hint_count"]
+    en_text = en_template.format(total)
+    zh_text = zh_template.format(total)
+    return {
+        "tag": "markdown",
+        "content": zh_text,
+        "i18n_content": _i18n(en_text, zh_text),
+        "text_size": "notation",
+    }
+
+
+def _enforce_panel_budget(panel: dict[str, Any]) -> dict[str, Any]:
+    """Trim oldest semantic groups until both CardKit budgets are safe."""
+    if (
+        _count_tag_objects(panel) <= _PANEL_ELEMENT_LIMIT
+        and _panel_wire_bytes(panel) <= _PANEL_WIRE_BYTES_LIMIT
+    ):
+        return panel
+
+    hint, groups = _panel_child_groups(list(panel.get("elements", [])))
+    trimmed = 0
+
+    def _rebuild() -> None:
+        rebuilt: list[dict] = []
+        if hint is not None or trimmed:
+            rebuilt.append(_collapse_hint(hint, trimmed))
+        for group in groups:
+            rebuilt.extend(group)
+        panel["elements"] = rebuilt or [{"tag": "markdown", "content": " "}]
+
+    _rebuild()
+    while len(groups) > 1 and (
+        _count_tag_objects(panel) > _PANEL_ELEMENT_LIMIT
+        or _panel_wire_bytes(panel) > _PANEL_WIRE_BYTES_LIMIT
+    ):
+        groups.pop(0)
+        trimmed += 1
+        _rebuild()
+
+    return panel
+
 def build_panel_children(*, reasoning_rounds: list, current_reasoning_text: str = "", tool_steps: list[dict], show_reasoning: bool = True, panel_events: list[tuple[str, int]] | None = None, max_tool_steps: int = 20, max_reasoning_rounds: int = 20) -> list[dict]:
     """Build child elements for unified panel body. Renders chronologically (panel_events)
     or sequentially (fallback). Trims to max_* limits (Feishu 200-element cap)."""
@@ -446,7 +565,7 @@ def build_unified_panel(*, reasoning_rounds: list, current_reasoning_text: str =
         "elements": children,
     }
     panel["element_id"] = element_id or UNIFIED_PANEL_ELEMENT_ID
-    return panel
+    return _enforce_panel_budget(panel)
 
 def _build_tool_step_elements(step: dict) -> list[dict]:
     elements: list[dict] = [_build_tool_step_title(step)]
@@ -461,7 +580,10 @@ def _build_tool_step_elements(step: dict) -> list[dict]:
 def _build_tool_step_title(step: dict) -> dict:
     status = step.get("status", "running")
     status_info = _tool_status_info(status)
-    title = step.get("title", step.get("name", "tool"))
+    title = _truncate_display_text(
+        str(step.get("title", step.get("name", "tool"))),
+        _TOOL_TITLE_DISPLAY_LIMIT,
+    )
     content = f"<font color='{status_info['color']}'>**{_escape_md(title)}**</font>"
     return {
         "tag": "div",
@@ -509,9 +631,10 @@ def _build_reasoning_round_title(round_index: int, elapsed_ms: float, finalized:
     }
 
 def _build_tool_step_detail(step: dict) -> dict | None:
-    detail = step.get("detail", "").strip()
+    detail = str(step.get("detail", "")).strip()
     if not detail:
         return None
+    detail = _truncate_display_text(detail, _TOOL_DETAIL_DISPLAY_LIMIT)
     return {
         "tag": "div",
         "margin": "0px 0px 0px 22px",
@@ -529,17 +652,33 @@ def _build_tool_step_output(step: dict) -> dict | None:
 
     lines: list[str] = []
     if error_block:
+        raw = str(error_block.get("content", ""))
+        if raw:
+            rendered = _format_code_block(
+                _truncate_display_text(raw, _TOOL_OUTPUT_DISPLAY_LIMIT),
+                str(error_block.get("language", "text")),
+            )
+        else:
+            rendered = _truncate_display_text(
+                str(error_block.get("fenced", "")),
+                _TOOL_OUTPUT_DISPLAY_LIMIT,
+            )
         lines.append("**Error**")
-        lines.append(
-            error_block.get("fenced")
-            or _format_code_block(error_block.get("content", ""), error_block.get("language", "text"))
-        )
+        lines.append(rendered)
     elif result_block:
+        raw = str(result_block.get("content", ""))
+        if raw:
+            rendered = _format_code_block(
+                _truncate_display_text(raw, _TOOL_OUTPUT_DISPLAY_LIMIT),
+                str(result_block.get("language", "json")),
+            )
+        else:
+            rendered = _truncate_display_text(
+                str(result_block.get("fenced", "")),
+                _TOOL_OUTPUT_DISPLAY_LIMIT,
+            )
         lines.append("**Result**")
-        lines.append(
-            result_block.get("fenced")
-            or _format_code_block(result_block.get("content", ""), result_block.get("language", "json"))
-        )
+        lines.append(rendered)
 
     if not lines:
         return None

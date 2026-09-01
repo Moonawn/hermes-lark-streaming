@@ -1,3 +1,10 @@
+## 1.7.0+moonawn.9 (unreleased fork candidate)
+
+- 修复真实长工具链触发 CardKit `300305 element exceeds the limit`：统一面板不再只按“20 轮/20 步”计数，而是按所有嵌套 `tag` 的真实 element 数限制在 180，并将 panel UTF-8 JSON 限制在 24 KB，为正文、loading 与 footer 预留容量。
+- 按完整推理/工具组裁剪最早过程，避免留下孤立的详情或结果；工具标题、详情与结果分别设显示上限，折叠/截断提示保留中英文，权威正文不参与过程面板裁剪。
+- 将 `300305` 作为永久 payload 错误处理：Phase 2 最多重试一次 answer-only；Phase 3、drain 与 seal 停止重复提交同一超限 panel；最终封卡可再以 answer-only compact seal 完成，避免请求风暴及无谓拆成第二条普通消息。
+- 增加最终 `batch_update` 与 `close_streaming` 成功 ACK 日志，便于 E2E 监控区分“已发请求”和“服务端已确认”。新增真实 element 预算、长 tool payload、Phase 2/3 与封卡恢复回归测试。
+
 ## 1.7.0+moonawn.8 (unreleased fork candidate)
 
 - 收紧旧 Hermes 无 status metadata 时的 compression lifecycle 兼容识别：只接受以已知状态图标和固定句式开头的自动状态行，不再全文搜索关键词。
