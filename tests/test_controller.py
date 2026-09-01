@@ -157,7 +157,11 @@ def test_on_interrupted_uses_new_message_id_and_anchor_alias() -> None:
     ctrl = StreamCardController()
     _enable(ctrl)
 
-    with patch.object(ctrl, "_fire_and_forget", side_effect=lambda coro, loop: coro.close()):
+    with patch.object(
+        ctrl,
+        "_fire_and_forget",
+        side_effect=lambda coro, loop: (coro.close(), MagicMock())[1],
+    ):
         ctrl.on_message_started(message_id="old", chat_id="chat")
         ctrl.on_interrupted(
             old_message_id="old",
@@ -1666,7 +1670,11 @@ def test_v134_concurrency_seal_no_duplicate_session() -> None:
     _enable(ctrl, linear=True)
 
     # 模拟 concurrency seal：先创建一个 active session（旧消息）
-    with patch.object(ctrl, "_fire_and_forget", side_effect=lambda coro, loop: coro.close()):
+    with patch.object(
+        ctrl,
+        "_fire_and_forget",
+        side_effect=lambda coro, loop: (coro.close(), MagicMock())[1],
+    ):
         ctrl.on_message_started(message_id="old_msg", chat_id="chat")
         assert "old_msg" in ctrl._sessions
 

@@ -37,6 +37,8 @@ class CardSession:
 
     __slots__ = (
         "_card_ready",
+        "_card_activation_lock",
+        "_card_activation_requested",
         "_continuation_reactivation_count",
         "_create_epoch_snap",
         "_creation_stages",
@@ -61,6 +63,7 @@ class CardSession:
         "deferred_background_review_closed",
         "deferred_background_review_lock",
         "deferred_background_reviews",
+        "defer_card_until_answer",
         "error_message",
         "existing_elements",
         "flush",
@@ -139,11 +142,19 @@ class CardSession:
         self._streaming_closed: bool = False
         # v1.2.0 L1: "streaming closed" 日志去重——同一张卡第一次打 INFO，之后降 DEBUG
         self._streaming_closed_logged: bool = False
+        # Card creation can be requested by callbacks arriving from different
+        # threads. Claim it before scheduling so a fast completion cannot
+        # overtake an IDLE create task.
+        self._card_activation_lock = Lock()
+        self._card_activation_requested: bool = False
         self._card_ready: asyncio.Event = asyncio.Event()
         self._delivery_done: asyncio.Event = asyncio.Event()
         self._delivery_success: bool = False
         self._is_continuation: bool = False
         self._continuation_reactivation_count: int = 0
+        # Snapshotted at message start so a config reload cannot strand a turn
+        # halfway through its lifecycle.
+        self.defer_card_until_answer: bool = False
 
     def mark_delivery_done(self, success: bool) -> None:
         """Legacy queue receipt: card/fallback ACK, not verified body delivery.

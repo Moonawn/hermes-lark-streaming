@@ -4,7 +4,7 @@
 
 这是 [Aowen-Nowor/hermes-lark-streaming](https://github.com/Aowen-Nowor/hermes-lark-streaming) 的独立 fork，基于上游 **v1.7.0 / `aef71a8`**。上游亦基于 [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming) 发展而来，原有署名与 MIT 许可证保留。此项目是 Hermes 插件，不是 Codex 插件。
 
-**当前是开发候选 `1.7.0+moonawn.3`，尚未宣称生产验证或发布稳定版。** 维护重点是终稿完整送达、流式任务可靠收尾，以及更安静、易读的展示。
+**当前是开发候选 `1.7.0+moonawn.4`，尚未发布稳定版。** 维护重点是终稿完整送达、流式任务可靠收尾，以及更安静、易读的展示。
 
 ## 已加入的修正
 
@@ -18,6 +18,7 @@
 - **可选群内队列**：按明确配置的群串行处理，保留独立入站消息，检查排队期间被撤回的消息；默认不改变群的并发策略。
 - **引用回复路由**：在 Hermes 计算 session 与投递 metadata 前清除普通 Feishu 引用回复携带的伪 `thread_id`，真实话题 thread 保持不变。
 - **压缩状态防误报**：若 Hermes 的 commit fence 已取消压缩提交，抑制后台清理阶段迟到的“compaction complete”成功提示；正常完成提示不变。
+- **首个答案再开流**：可让 preflight compression 只显示普通状态消息，直到出现 answer 内容才创建 CardKit 流式卡；仅返回 final、压缩期停止或被新消息打断时，不留下加载占位卡。
 
 保留上游 v1.7.0 的 relay 支持、schema 错误恢复、Markdown 缓存与面板记录上限。
 
@@ -28,6 +29,8 @@
 | 默认兼容模式 | 完整流式正文和工具过程 | 原卡片，必要时文本兜底 |
 | 独立答复 + full | 保留流式正文预览 | 另发独立答复 |
 | 独立答复 + compact | 短状态、可折叠工具过程 | 另发独立答复，适合长文与多人群 |
+
+配置 `streaming_card_start: first_answer` 后，preflight/compression 阶段不创建主流式卡；首张主卡直接带回答元素，从“正在生成答复”开始，不再短暂闪回“正在加载上下文”。默认值仍是兼容旧 Profile 的 `message_start`。
 
 紧凑模式中的“生成完成 · Final answer follows”表示正文将由独立消息承载，**不等于正文送达回执**。回读状态 `verified` 表示服务端正文与预期发送载荷一致，不代表用户已阅读，也不保证不同客户端的排版完全相同。
 

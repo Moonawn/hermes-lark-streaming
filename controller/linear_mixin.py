@@ -138,13 +138,22 @@ class UnifiedControllerMixin:
 
     @serialized_card_write
     async def _do_create_linear_card(self, session: CardSession) -> None:
-        """Create the initial placeholder card — loading hint only, no panel."""
-        if session.state != IDLE:
-            return
-        # Snapshot epoch before async creation
-        epoch = session.create_epoch
-        session.state = CREATING
-        session._create_epoch_snap = epoch
+        """Create the initial streaming card for the selected start mode."""
+        # Normal callers claim CREATING synchronously before scheduling. Keep
+        # direct invocation compatible for tests and older internal callers.
+        with session._card_activation_lock:
+            if session.state == IDLE:
+                session._card_activation_requested = True
+                session.state = CREATING
+                session._create_epoch_snap = session.create_epoch
+            elif not (
+                session._card_activation_requested
+                and session.state in (CREATING, COMPLETING, ABORTED)
+                and not session.card_id
+                and not session._card_ready.is_set()
+            ):
+                return
+            epoch = session._create_epoch_snap
         session.linear = True
         # v1.4.0 fix (问题3 根因1 — delegate_task 后卡片降级纯文本):
         if session.unified_state is None:
@@ -156,10 +165,18 @@ class UnifiedControllerMixin:
 
             try:
                 reply_to = session.anchor_id or session.message_id
+                first_answer_start = bool(
+                    session.defer_card_until_answer
+                    and session.unified_state is not None
+                    and session.unified_state.answer_text
+                )
                 card = build_streaming_card_v2(
                     include_unified_panel=False,   # Panel added on first token
-                    include_answer_element=False,   # Answer element added with panel
-                    include_loading_hint=True,      # "正在加载上下文..."
+                    # First-answer mode allocates the answer element in the
+                    # initial card, avoiding a misleading late flash of
+                    # "loading context" after compression has ended.
+                    include_answer_element=first_answer_start,
+                    include_loading_hint=not first_answer_start,
                     streaming_panel_expanded=self._cfg.streaming_panel_expanded,
                     print_strategy=self._cfg.print_strategy,
                     print_step=self._cfg.print_step,
@@ -172,12 +189,21 @@ class UnifiedControllerMixin:
                 session.card_created_at = _time.time()
                 session.flush.set_throttle(self._cfg.flush_interval_sec)
 
-                # Track existing elements — only 2 are pre-allocated
-                session.existing_elements = {
-                    _LOADING_HINT_ELEMENT_ID,
-                    _LOADING_ELEMENT_ID,
-                }
+                session.existing_elements = {_LOADING_ELEMENT_ID}
+                if first_answer_start:
+                    session.existing_elements.add(ANSWER_ELEMENT_ID)
+                    session._creation_stages.add("answer")
+                    session._creation_stages.add("hint_removed")
+                else:
+                    session.existing_elements.add(_LOADING_HINT_ELEMENT_ID)
                 session._creation_stages.discard("panel")  # Panel NOT in initial card
+
+                try:
+                    from ..aowen import record_card_created, set_active_sessions
+                    record_card_created()
+                    set_active_sessions(self._sess_active_count())
+                except Exception:
+                    _logger.debug("metrics: record_card_created failed", exc_info=True)
 
             except FeishuAPIError as e:
                 _logger.info("linear CardKit create failed: %s", e)

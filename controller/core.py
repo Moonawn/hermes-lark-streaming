@@ -17,7 +17,9 @@ from .mixin import (
     ABORTED,
     COMPLETED,
     COMPLETING,
+    CREATING,
     CREATION_FAILED,
+    IDLE,
     TERMINATED,
     ControllerMixin,
 )
@@ -270,8 +272,7 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         new_session.anchor_id = anchor_id if anchor_id != new_message_id else None
         new_session._is_continuation = True
         # v1.4.0 fix: 预先创建 unified_state + 标记 linear=True，避免 on_answer 在
-        new_session.linear = True
-        new_session.unified_state = UnifiedLinearState()
+        self._prepare_linear_session(new_session, defer_until_answer=False)
         self._sess_put(new_message_id, new_session)
         # 不抢 anchor_id key——原 session 仍可能用 anchor_id 作 alias key，
         # 新 session 只通过 new_message_id 索引（避免覆盖原 alias 引发误清理）。
@@ -286,8 +287,17 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
             stale_session.state,
         )
 
-        # 异步触发新卡片创建（_do_create_linear_card 内部 IDLE 守卫保证幂等）
-        self._fire_and_forget(self._do_create_linear_card(new_session), loop)
+        # 续写由真实 answer token 触发，立即开启下一张卡。
+        if not self._request_linear_card(
+            new_session, source="continuation_answer"
+        ):
+            _logger.warning(
+                "HLS: reactivation creation dispatch failed old_msg=%s new_msg=%s",
+                (stale_session.message_id or "?")[:12],
+                new_message_id[:12],
+            )
+            self._cleanup(new_message_id)
+            return None
 
         # v1.7.0 (R3-08): count the reactivation ONLY now that the new session
         # is registered and its creation has been dispatched.
@@ -381,6 +391,86 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
             _logger.debug("fire_and_forget failed", exc_info=True)
             return None
 
+    def _prepare_linear_session(
+        self,
+        session: CardSession,
+        *,
+        defer_until_answer: bool | None = None,
+    ) -> None:
+        """Initialize state before any model callback can arrive."""
+        session.linear = True
+        if session.unified_state is None:
+            session.unified_state = UnifiedLinearState()
+        session.defer_card_until_answer = (
+            self._cfg.defer_streaming_card_until_answer
+            if defer_until_answer is None
+            else bool(defer_until_answer)
+        )
+
+    def _request_linear_card(self, session: CardSession, *, source: str) -> bool:
+        """Atomically claim and schedule CardKit creation exactly once."""
+        with session._card_activation_lock:
+            if session.state != IDLE or session._card_activation_requested:
+                return False
+            session._card_activation_requested = True
+            session.state = CREATING
+            session._create_epoch_snap = session.create_epoch
+
+        _logger.info(
+            "HLS: streaming card activation requested source=%s msg=%s trace=%s",
+            source,
+            (session.message_id or "?")[:12],
+            session.card_trace_id,
+        )
+        task = self._fire_and_forget(
+            self._do_create_linear_card(session), session._loop
+        )
+        if task is not None:
+            return True
+
+        # Scheduling failure must release every completion waiter and hand the
+        # final answer back to the gateway instead of leaving CREATING live.
+        with session._card_activation_lock:
+            if session.state == CREATING and not session.card_id:
+                session.state = CREATION_FAILED
+                session.enter_terminal(
+                    reason=TerminalReason.CREATION_FAILED,
+                    source=f"{source}_schedule_failed",
+                )
+                session._card_ready.set()
+                session.mark_delivery_done(False)
+        return False
+
+    def _finish_without_streaming_card(
+        self,
+        session: CardSession,
+        *,
+        aborted: bool,
+        error: bool,
+        source: str,
+    ) -> None:
+        """Close an intentionally unactivated session without an orphan card."""
+        session.state = ABORTED if aborted else COMPLETED
+        session.enter_terminal(
+            reason=(
+                TerminalReason.ABORT
+                if aborted
+                else TerminalReason.ERROR if error else TerminalReason.NORMAL
+            ),
+            source=source,
+        )
+        session.flush.abort_pending()
+        session.writer.close()
+        session._card_ready.set()
+        # No card was published. False keeps serialized legacy delivery free
+        # to use the gateway's native final-message path.
+        session.mark_delivery_done(False)
+        try:
+            from ..aowen import set_active_sessions
+            set_active_sessions(self._sess_active_count())
+        except Exception:
+            _logger.debug("metrics: set_active_sessions failed", exc_info=True)
+
     def on_message_started(
         self,
         *,
@@ -458,17 +548,17 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
                 "HLS: session already created by concurrency seal, reusing msg=%s trace=%s",
                 (message_id or "?")[:12], existing.card_trace_id,
             )
-            if not existing._card_ready.is_set():
-                self._fire_and_forget(self._do_create_linear_card(existing), loop)
+            if not existing.defer_card_until_answer:
+                self._request_linear_card(existing, source="message_start_reuse")
             try:
-                from ..aowen import record_card_created, set_active_sessions
-                record_card_created()
+                from ..aowen import set_active_sessions
                 set_active_sessions(self._sess_active_count())
             except Exception:
-                _logger.debug('metrics: record_card_created failed (reuse path)', exc_info=True)
+                _logger.debug('metrics: set_active_sessions failed (reuse path)', exc_info=True)
             return
 
         session = CardSession(message_id, chat_id, loop)
+        self._prepare_linear_session(session)
         self._sess_put(message_id, session)
         if anchor_id and anchor_id != message_id:
             session.anchor_id = anchor_id
@@ -477,13 +567,18 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
 
         # v1.1.0: Record metrics
         try:
-            from ..aowen import record_card_created, set_active_sessions
-            record_card_created()
+            from ..aowen import set_active_sessions
             set_active_sessions(self._sess_active_count())
         except Exception:
-            _logger.debug('metrics: record_card_created failed', exc_info=True)
+            _logger.debug('metrics: set_active_sessions failed', exc_info=True)
 
-        self._fire_and_forget(self._do_create_linear_card(session), loop)
+        if session.defer_card_until_answer:
+            _logger.info(
+                "HLS: deferring streaming card until first answer msg=%s trace=%s",
+                (message_id or "?")[:12], session.card_trace_id,
+            )
+        else:
+            self._request_linear_card(session, source="message_start")
 
     def on_thinking(self, *, message_id: str, text: str) -> None:
         """思考内容增量."""
@@ -493,7 +588,17 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         if session is None or session.state == COMPLETING or session.guard.should_skip("on_thinking"):
             return
 
+        had_answer = bool(
+            session.unified_state and session.unified_state.answer_text
+        )
         self._linear_on_thinking(session, text)
+        if (
+            session.defer_card_until_answer
+            and not had_answer
+            and session.unified_state is not None
+            and bool(session.unified_state.answer_text)
+        ):
+            self._request_linear_card(session, source="thinking_answer")
 
     def on_reasoning(self, *, message_id: str, text: str) -> None:
         """Native model reasoning delta (incremental append)."""
@@ -596,6 +701,8 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
                 _logger.warning("HLS: on_answer but unified_state is None, skipping msg=%s", (message_id or "?")[:12])
                 return
             session.unified_state.on_answer_delta(answer_text)
+            if session.defer_card_until_answer:
+                self._request_linear_card(session, source="answer_delta")
             self._schedule_linear_flush(session)
 
     def on_aborted(self, *, message_id: str) -> None:
@@ -620,6 +727,11 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
             session._was_aborted = True
             return
 
+        unactivated = (
+            session.defer_card_until_answer
+            and session.state == IDLE
+            and not session._card_activation_requested
+        )
         session._was_aborted = True
         session.state = ABORTED
         # v1.7.0 (R3-01): record terminal metadata on the ABORTED path too —
@@ -637,7 +749,15 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         except Exception:
             _logger.debug('metrics: record_card_aborted failed', exc_info=True)
 
-        self._complete_session(session)
+        if unactivated:
+            self._finish_without_streaming_card(
+                session,
+                aborted=True,
+                error=False,
+                source="on_aborted_before_answer",
+            )
+        else:
+            self._complete_session(session)
 
     def on_interrupted(
         self,
@@ -661,6 +781,11 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
                     old_message_id[:12],
                 )
             else:
+                unactivated = (
+                    old_session.defer_card_until_answer
+                    and old_session.state == IDLE
+                    and not old_session._card_activation_requested
+                )
                 old_session._was_aborted = True
                 old_session.error_message = "Interrupted by new message"
 
@@ -738,13 +863,22 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
                         "on_interrupted: abort old msg=%s",
                         old_message_id[:12],
                     )
-                    self._complete_session(old_session)
+                    if unactivated:
+                        self._finish_without_streaming_card(
+                            old_session,
+                            aborted=True,
+                            error=False,
+                            source="on_interrupted_before_answer",
+                        )
+                    else:
+                        self._complete_session(old_session)
 
         if self._sess_get(new_message_id) is None:
             loop = self._get_loop()
             if loop is not None:
                 reply_anchor_id = anchor_id if anchor_id and anchor_id != new_message_id else None
                 session = CardSession(new_message_id, chat_id, loop)
+                self._prepare_linear_session(session)
                 session.anchor_id = reply_anchor_id
                 self._sess_put(new_message_id, session)
                 if reply_anchor_id:
@@ -756,7 +890,10 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
                     (reply_anchor_id or new_message_id)[:12],
                 )
                 # v1.1.0 (Task 1.1+1.2): linear is the only creation path now.
-                self._fire_and_forget(self._do_create_linear_card(session), loop)
+                if not session.defer_card_until_answer:
+                    self._request_linear_card(
+                        session, source="interrupted_message_start"
+                    )
 
         # v1.3.0: protect _interrupt_map with its own lock (separate from
         # _sessions_lock to avoid holding both locks simultaneously → deadlock risk)
@@ -915,6 +1052,29 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
             **({"estimated_cost_usd": estimated_cost_usd} if estimated_cost_usd else {}),
             **({"cost_status": cost_status} if cost_status and cost_status != "unknown" else {}),
         }
+
+        # Some providers return an authoritative final without ever emitting
+        # an answer delta. A progress card created after generation would
+        # flash late and add no value, so intentionally skip it and let the
+        # gateway deliver the final text. This also bounds compression-only
+        # failures without waiting on _card_ready.
+        if (
+            session.defer_card_until_answer
+            and session.state == IDLE
+            and not session._card_activation_requested
+        ):
+            self._finish_without_streaming_card(
+                session,
+                aborted=aborted,
+                error=bool(error_message) and not aborted,
+                source="completed_before_answer_delta",
+            )
+            _logger.info(
+                "HLS: no answer delta; skipped late streaming card and yielded "
+                "final to gateway msg=%s",
+                (message_id or "?")[:12],
+            )
+            return False
 
         if session.unified_state is not None:
             session.unified_state.freeze_answer()

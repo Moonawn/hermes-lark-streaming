@@ -1,3 +1,16 @@
+## 1.7.0+moonawn.4 (unreleased fork candidate)
+
+- 新增可选 `streaming_card_start: first_answer`：preflight context compression 期间不创建 CardKit 主流式卡，首段 answer 到达后直接发布带回答元素的卡片，避免“加载上下文”晚闪与长时间暴露。
+- reasoning/tool 事件可在开卡前缓存；answer 既可能来自 `on_answer_delta`，也可能嵌在 thinking callback 中，两条路径都会原子地触发一次开卡。
+- provider 只有 final、压缩期 `/stop`、新消息打断和开卡调度失败均有有界终态，不等待未发生的 `_card_ready`，也不遗留加载卡；完成与创建竞态仍会完成已认领的卡片。
+- 真正收到 CardKit 发布 ACK 后才计入 cards-created 指标。新增配置、竞态、停止和 final-only 回归测试；默认 `message_start` 行为不变。
+
+## 1.7.0+moonawn.3 (unreleased fork candidate)
+
+- CardKit create/reply 的重试链复用 UUID，服务端已接收但 ACK 丢失时不会重复发布加载卡。
+- 紧凑过程卡的完成文案改为“生成完成 · Final answer follows”，避免把生成状态误读成正文送达回执。
+- 补充 preflight compression、长输出、进程中断与可恢复边界说明。
+
 ## 1.7.0+moonawn.2 (unreleased fork candidate)
 
 - 在 FeishuAdapter 进入原生 message guard 前归一化引用回复路由，避免普通 reply 的伪 `thread_id` 污染 session key 与最终投递 metadata；保留服务端回读 guard 对错 thread 的 fail-closed 拦截。

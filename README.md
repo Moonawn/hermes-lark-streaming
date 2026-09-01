@@ -4,7 +4,7 @@
 
 An independently maintained fork of [Aowen-Nowor/hermes-lark-streaming](https://github.com/Aowen-Nowor/hermes-lark-streaming), based on upstream **v1.7.0** (`aef71a8`). The upstream project in turn credits [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming). Original attribution and the MIT license are retained.
 
-**Development candidate: `1.7.0+moonawn.3`. No production rollout or stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a calmer reading experience. It is a Hermes plugin, not a Codex plugin.
+**Development candidate: `1.7.0+moonawn.4`. No stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a calmer reading experience. It is a Hermes plugin, not a Codex plugin.
 
 ## What changes
 
@@ -18,6 +18,7 @@ An independently maintained fork of [Aowen-Nowor/hermes-lark-streaming](https://
 - Optional per-chat queues retain individual messages and check for withdrawn queued messages. No chat is serialized unless explicitly configured.
 - Feishu reply routing is normalized before Hermes derives the session and delivery metadata: a synthetic `thread_id` on an ordinary reply is removed, while a genuine topic thread is preserved.
 - A feature-detected compression guard suppresses Hermes' late “compaction complete” success message only when that attempt's commit fence was cancelled. Normal completion remains visible.
+- Optional first-answer activation leaves preflight compression on ordinary status messages and creates the CardKit stream only when answer text exists. Fast final-only, stopped, and interrupted turns do not leave a loading-only card.
 
 Upstream v1.7.0's relay support, schema-error recovery, Markdown escape cache and bounded panel history remain in place.
 
@@ -28,6 +29,8 @@ Upstream v1.7.0's relay support, schema-error recovery, Markdown escape cache an
 | Default / legacy | Full streamed body and tools | Same card; lossless text fallback if necessary | Compatibility |
 | Separate + full | Full streamed preview | Independent native message | Keep the typing experience |
 | Separate + compact | Short status and collapsible tools | Independent native message | Long answers and busy groups |
+
+Set `streaming_card_start: first_answer` to keep preflight/compression outside the streaming card. The first published card already contains the answer element, so it starts at “Writing…” without flashing a stale “loading context” hint. The default `message_start` behavior remains compatible with existing Profiles.
 
 The card's “Final answer follows” label describes generation and the next delivery step; it is **not** a delivery receipt. `verified` means the read-back matches the expected outbound payload; it does not prove a person read the message or that every client rendered it identically.
 

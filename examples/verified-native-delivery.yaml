@@ -4,6 +4,7 @@
 hermes_lark_streaming:
   final_delivery: separate_message
   progress_card: compact
+  streaming_card_start: first_answer
   verified_delivery: true
 gateway:
   delivery_ledger: false       # exactly one recovery sender, not two

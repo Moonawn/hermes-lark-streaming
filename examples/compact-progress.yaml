@@ -4,6 +4,7 @@ hermes_lark_streaming:
   enabled: true
   final_delivery: separate_message
   progress_card: compact       # full keeps streamed body previews
+  streaming_card_start: first_answer  # preflight/compression stays non-streaming
   verified_delivery: false     # keep the native Hermes delivery owner
   card_completion_timeout_sec: 10
   answer_flush_interval_ms: 800

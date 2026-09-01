@@ -19,13 +19,15 @@
 
 `final_delivery: separate_message` 将过程卡与正文分离。`progress_card: compact` 只在该模式生效，避免把兼容模式中唯一的正文隐藏。推荐收起过程面板，关闭 reasoning 展示；想看逐步正文时使用 `progress_card: full`，并适当调低刷新频率。
 
+`streaming_card_start: first_answer` 会在首段 answer 内容出现时才创建 CardKit 卡片。compression progress 仍由 Hermes 通过普通 gateway 状态消息展示；reasoning 与 tool 事件先缓存在内存，主卡创建后再统一刷新。若 provider 只有 final 而没有 delta，或用户在压缩期停止/发来新消息，本轮不会事后补建一张没有阅读价值的流式卡，最终正文交回 gateway。默认 `message_start` 保持旧行为。
+
 配置初值：正文刷新 800ms、面板刷新 1000ms。它们是易读性起点，不是平台限流保证；高并发仍需观察错误率和时延。紧凑模式以“生成完成 · Final answer follows”明确提示独立正文仍在后续投递，不改变保存的终稿，也不把过程状态当交付回执。
 
 卡片实体创建后还要经过一次 IM 发布。发布请求对同一次重试链复用 UUID；即使服务端已经接收而客户端丢失 ACK，也不会因为插件内部重试产生两张加载卡。进程在卡片创建与发布之间崩溃仍可能留下不可见的 CardKit 实体；进程在卡片已经可见后永久挂起或退出，也可能留下未关闭的“生成中”卡片，当前内存态插件无法在重启后恢复这类卡片生命周期。
 
 ## 长会话与 Hermes 自动压缩
 
-长会话在开始生成正文前，Hermes 会同步运行 preflight context compression。固定兼容基线 v2026.8.13、v2026.8.16.2 和 v2026.8.27 均把从 `auxiliary.compression.timeout` 读取的辅助模型超时下限钳制为 300 秒；仅把该配置写成更小的值不能缩短这段等待。摘要模型失败后还可能回退到主模型，因此用户看到的首字等待可能明显长于模型真正生成答案的时间。
+长会话在开始生成正文前，Hermes 会同步运行 preflight context compression。启用 `streaming_card_start: first_answer` 后，这段等待不会占用主流式卡；它缩短了卡片暴露在断线、重启和自动关闭风险下的时间，但不缩短 compression 本身。固定兼容基线 v2026.8.13、v2026.8.16.2 和 v2026.8.27 均把从 `auxiliary.compression.timeout` 读取的辅助模型超时下限钳制为 300 秒；仅把该配置写成更小的值不能缩短这段等待。摘要模型失败后还可能回退到主模型，因此用户看到的首字等待可能明显长于模型真正生成答案的时间。
 
 Hermes 的 host wrapper 可用下面的配置限制前台等待；这是超时保护，不是压缩质量修复：
 

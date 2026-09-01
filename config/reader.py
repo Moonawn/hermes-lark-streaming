@@ -137,6 +137,21 @@ class Config:
         return self.independent_final_delivery and self._plugin_sec().get("progress_card") == "compact"
 
     @property
+    def defer_streaming_card_until_answer(self) -> bool:
+        """Create the CardKit streaming card only when answer text exists.
+
+        Hermes may spend minutes in preflight context compression before the
+        model can produce an answer. Keeping that phase outside a long-lived
+        streaming card avoids loading-only cards that can be stranded by a
+        restart or interruption. The legacy message-start behavior stays the
+        default for compatibility.
+        """
+        value = str(
+            self._plugin_sec().get("streaming_card_start", "message_start")
+        ).strip().lower()
+        return value == "first_answer"
+
+    @property
     def panel_expanded(self) -> bool:
         sec = self._plugin_sec()
         return _to_bool(sec.get("panel_expanded", False))
