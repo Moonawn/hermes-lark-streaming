@@ -4,12 +4,12 @@
 
 An independently maintained fork of [Aowen-Nowor/hermes-lark-streaming](https://github.com/Aowen-Nowor/hermes-lark-streaming), based on upstream **v1.7.0** (`aef71a8`). The upstream project in turn credits [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming). Original attribution and the MIT license are retained.
 
-**Development candidate: `1.7.0+moonawn.2`. No production rollout or stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a calmer reading experience. It is a Hermes plugin, not a Codex plugin.
+**Development candidate: `1.7.0+moonawn.3`. No production rollout or stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a calmer reading experience. It is a Hermes plugin, not a Codex plugin.
 
 ## What changes
 
 - The final response replaces streamed progress even when it is shorter. Distinct later final phases are handed back to the gateway instead of being silently discarded.
-- Card creation, updates and sealing share one writer. An old ACK cannot clear a newer answer revision.
+- Card creation, updates and sealing share one writer. An old ACK cannot clear a newer answer revision; CardKit publication retries reuse one UUID so an accepted request with a lost ACK does not create a second loading card.
 - Completion has a deadline for every chat. Cancellation releases waiters and ends the session; an orphaned completion does not live forever. A failed card gets a bounded attempt to close its typing animation.
 - Legacy text fallback retains the complete answer, splits it without dropping separators, and reuses per-turn, per-part UUIDs on retry.
 - Optional **separate final delivery** keeps progress-card status independent of final-message delivery. Native failed chunks cannot be hidden behind a later successful chunk.
@@ -29,7 +29,7 @@ Upstream v1.7.0's relay support, schema-error recovery, Markdown escape cache an
 | Separate + full | Full streamed preview | Independent native message | Keep the typing experience |
 | Separate + compact | Short status and collapsible tools | Independent native message | Long answers and busy groups |
 
-The card's “Processing finished” label describes generation, **not** a delivery receipt. `verified` means the read-back matches the expected outbound payload; it does not prove a person read the message or that every client rendered it identically.
+The card's “Final answer follows” label describes generation and the next delivery step; it is **not** a delivery receipt. `verified` means the read-back matches the expected outbound payload; it does not prove a person read the message or that every client rendered it identically.
 
 Merge [the compact example](examples/compact-progress.yaml) into a **test Profile**, not over an existing configuration. To retain streamed body text, set `progress_card: full`. Experimental verified delivery is a separate opt-in; see [the verified example](examples/verified-native-delivery.yaml) and [its limits](docs/MAINTENANCE.md#verified-delivery).
 

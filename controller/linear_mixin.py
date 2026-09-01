@@ -120,7 +120,9 @@ def _final_card_answer(state: UnifiedLinearState, cfg: Any, *, is_error=False, i
         if is_error:
             return "处理异常 · Processing error"
         # This is a generation status, deliberately not a delivery receipt.
-        return "处理结束 · Processing finished"
+        # Say what happens next so a delayed independent send does not make the
+        # closed progress card look like proof that the final already arrived.
+        return "生成完成 · Final answer follows"
     return escape_markdown_asterisks(_downgrade_tables(optimize_markdown_style(state.answer_text))) or " "
 
 class UnifiedControllerMixin:

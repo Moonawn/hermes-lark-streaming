@@ -12,12 +12,15 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-
 from hermes_lark_streaming.config import Config
 from hermes_lark_streaming.controller import CardSession, StreamCardController
+from hermes_lark_streaming.feishu.client import FeishuClient
 from hermes_lark_streaming.patching import _msg_ctx
 from hermes_lark_streaming.patching.adapter import _dispatch_feishu_outbound
-from hermes_lark_streaming.patching.gateway import _wrap_handle_message_with_agent, _wrap_run_agent
+from hermes_lark_streaming.patching.gateway import (
+    _wrap_handle_message_with_agent,
+    _wrap_run_agent,
+)
 from hermes_lark_streaming.state.linear import UnifiedLinearState
 from hermes_lark_streaming.state.phase import CardPhase
 
@@ -44,6 +47,58 @@ def setup(*, separate=False, message_id="om_turn"):
     )
     ctrl._schedule_linear_flush = Mock()
     return ctrl, session
+
+
+@pytest.mark.asyncio
+async def test_card_publication_ack_loss_retries_with_one_uuid(monkeypatch):
+    """Accepted card sends must stay idempotent when their ACK is lost."""
+    accepted: dict[str, str] = {}
+    seen_uuids: list[str] = []
+
+    class MessageAPI:
+        async def _accept(self, request):
+            import httpx
+
+            request_uuid = request.request_body.uuid
+            seen_uuids.append(request_uuid)
+            if request_uuid not in accepted:
+                accepted[request_uuid] = f"om_card_{len(accepted) + 1}"
+                # Simulate the server accepting the reply while its ACK is
+                # lost on the wire. The retry must address the same operation.
+                raise httpx.ReadTimeout("ACK lost after accept")
+            return SimpleNamespace(
+                success=lambda: True,
+                code=0,
+                msg="ok",
+                data=SimpleNamespace(message_id=accepted[request_uuid]),
+            )
+
+        async def areply(self, request):
+            return await self._accept(request)
+
+        async def acreate(self, request):
+            return await self._accept(request)
+
+    client = object.__new__(FeishuClient)
+    client._client = SimpleNamespace(
+        im=SimpleNamespace(v1=SimpleNamespace(message=MessageAPI()))
+    )
+    monkeypatch.setattr(
+        "hermes_lark_streaming.feishu.client.asyncio.sleep", AsyncMock()
+    )
+
+    message_ids = [
+        await client.reply_card_by_id("om_origin", "card_entity"),
+        await client.reply_card("om_origin", {"schema": "2.0"}),
+        await client.send_card_to_chat("oc_chat", {"schema": "2.0"}),
+    ]
+
+    assert message_ids == ["om_card_1", "om_card_2", "om_card_3"]
+    assert len(seen_uuids) == 6
+    assert seen_uuids[0] == seen_uuids[1]
+    assert seen_uuids[2] == seen_uuids[3]
+    assert seen_uuids[4] == seen_uuids[5]
+    assert len(set(seen_uuids)) == len(accepted) == 3
 
 
 @pytest.mark.asyncio
@@ -381,7 +436,7 @@ async def test_compact_card_renders_status_without_losing_the_separate_final():
     await ctrl._do_linear_complete_with_fallback(session)
     actions = ctrl._client.cardkit_batch_update.await_args.args[1]
     rendered = [a.get("params", {}).get("partial_element", {}).get("content") for a in actions]
-    assert "处理结束 · Processing finished" in rendered
+    assert "生成完成 · Final answer follows" in rendered
     assert session.final_answer == final
     ctrl._client.reply_text.assert_not_awaited()
 

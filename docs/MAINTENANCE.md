@@ -19,7 +19,26 @@
 
 `final_delivery: separate_message` 将过程卡与正文分离。`progress_card: compact` 只在该模式生效，避免把兼容模式中唯一的正文隐藏。推荐收起过程面板，关闭 reasoning 展示；想看逐步正文时使用 `progress_card: full`，并适当调低刷新频率。
 
-配置初值：正文刷新 800ms、面板刷新 1000ms。它们是易读性起点，不是平台限流保证；高并发仍需观察错误率和时延。紧凑模式不改变保存的终稿，也不把过程状态当交付回执。
+配置初值：正文刷新 800ms、面板刷新 1000ms。它们是易读性起点，不是平台限流保证；高并发仍需观察错误率和时延。紧凑模式以“生成完成 · Final answer follows”明确提示独立正文仍在后续投递，不改变保存的终稿，也不把过程状态当交付回执。
+
+卡片实体创建后还要经过一次 IM 发布。发布请求对同一次重试链复用 UUID；即使服务端已经接收而客户端丢失 ACK，也不会因为插件内部重试产生两张加载卡。进程在卡片创建与发布之间崩溃仍可能留下不可见的 CardKit 实体；进程在卡片已经可见后永久挂起或退出，也可能留下未关闭的“生成中”卡片，当前内存态插件无法在重启后恢复这类卡片生命周期。
+
+## 长会话与 Hermes 自动压缩
+
+长会话在开始生成正文前，Hermes 会同步运行 preflight context compression。固定兼容基线 v2026.8.13、v2026.8.16.2 和 v2026.8.27 均把从 `auxiliary.compression.timeout` 读取的辅助模型超时下限钳制为 300 秒；仅把该配置写成更小的值不能缩短这段等待。摘要模型失败后还可能回退到主模型，因此用户看到的首字等待可能明显长于模型真正生成答案的时间。
+
+Hermes 的 host wrapper 可用下面的配置限制前台等待；这是超时保护，不是压缩质量修复：
+
+```yaml
+compression:
+  context_timeout_seconds: 45
+  context_total_ceiling_seconds: 90
+  progress_notices: true
+```
+
+超时后 Hermes 返回原始上下文继续本轮，commit fence 会阻止迟到的 worker 改写会话数据库；worker 本身不能被 Python 安全强杀，仍会在小型 compression thread pool 中继续到 provider 返回。连续失败会触发 60/300/900 秒冷却，避免每轮都重复等待，但会话仍然过长，之后仍有 provider context overflow、后台 worker 占满和响应质量下降风险。本插件只抑制 fence 已取消后迟到的“compaction complete”误报，不改变 Hermes 的压缩调度或 provider 调用。
+
+长期方案是为 compression 配置快速、稳定且上下文足够的 auxiliary model/provider，并观察其延迟和失败率；在明确的工作阶段边界主动 `/new`，避免单个 session 无限增长。不要把 45/90 秒保护理解为已经成功压缩。
 
 ## verified-delivery
 
@@ -45,6 +64,8 @@ Outbox 在 `$HERMES_HOME/delivery/feishu-outbox.sqlite3`，保存原始终稿、
 - 停止/重启可恢复已持久化任务，但模型返回到 outbox 落盘之前的进程崩溃不在保证范围内。
 - Profile 路径与 app 身份参与 scope。不要随意更改 scope、跨 Profile 复制数据库或批量重置状态；迁移需单独审查。
 - 卡片 API 的 ACK、文本发送 ACK、正文回读确认和用户已读是四个不同层次。本插件不承诺端到端 exactly-once 或用户已读。
+
+未启用 `verified_delivery` 时，最终正文仍由 Hermes 原生 Feishu sender 负责。当前固定 Hermes 基线的原生 sender 使用通用 `truncate_message` 分片，边界处会 `lstrip()`，可能丢失有意义的空白；网络结果不明时，内部重试还会生成新的 UUID，存在服务端已接收却重复发送的窗口。普通短文不容易触发，但要求字节级完整的长文、代码、表格或大段空白不能视为已验证交付。原生 Feishu 部署如重视这类内容，应在测试 Profile 按上述互斥配置启用本插件 verified delivery，再做权限、限流和真实客户端 canary。
 
 ## 验证与发布
 
