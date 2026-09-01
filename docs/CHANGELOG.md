@@ -1,3 +1,8 @@
+## 1.7.0+moonawn.8 (unreleased fork candidate)
+
+- 收紧旧 Hermes 无 status metadata 时的 compression lifecycle 兼容识别：只接受以已知状态图标和固定句式开头的自动状态行，不再全文搜索关键词。
+- 防止解释 `context compression timed out`、`Compacting context` 等内容的正常回答在 CardKit 失败后的普通正文兜底路径中被误判为状态并吞掉；手工 `/compress` feedback 继续可见。
+
 ## 1.7.0+moonawn.7 (unreleased fork candidate)
 
 - Hermes gateway status callback 会在 worker thread 创建 coroutine 时携带原始 Feishu turn 标识，避免切换到 gateway loop 后丢失 ContextVar 归属。

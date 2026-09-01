@@ -34,20 +34,19 @@ _card_reply_contexts: OrderedDict[str, str] = OrderedDict()
 _card_reply_contexts_lock = threading.Lock()
 
 _COMPRESSION_LIFECYCLE_RE = re.compile(
-    r"(?:"
-    r"pre(?:flight|-api| api)\s+compression"
-    r"|compacting\s+context"
-    r"|context\s+compaction\s+complete"
-    r"|context\s+compression\s+timed\s+out"
-    r"|context\s+is\s+over\s+the\s+compression\s+threshold"
-    r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
-    r"|context\s+too\s+large\s+\(~?[\d,]+\s+tokens\)"
-    r"|compressed\s+~?[\d,]+\s+(?:→|->)\s+~?[\d,]+\s+"
-      r"(?:messages|tokens),\s+retrying"
-    r"|context\s+reduced\s+to\s+[\d,]+\s+tokens"
-    r"|session\s+compressed\s+\d+\s+times"
+    r"^\s*(?:"
+    r"📦\s+(?:preflight|pre-api|pre api)\s+compression\s*:"
+    r"|🗜️?\s+(?:compacting\s+context\b|context\s+too\s+large\b|"
+      r"compressed\s+~?[\d,]+\s+(?:→|->)\s+~?[\d,]+\s+"
+      r"(?:messages|tokens),\s+retrying\b|context\s+reduced\s+to\b)"
+    r"|💤\s+resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting\b"
+    r"|⟳\s+compacting\s+context\b"
+    r"|✓\s+context\s+compaction\s+complete\b"
+    r"|⚠️?\s+context\s+compression\s+timed\s+out\b"
+    r"|⚠️?\s+context\s+is\s+over\s+the\s+compression\s+threshold\b"
+    r"|⚠️?\s+session\s+compressed\s+\d+\s+times\b"
     r")",
-    re.IGNORECASE | re.DOTALL,
+    re.IGNORECASE,
 )
 
 
