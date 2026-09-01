@@ -1,3 +1,7 @@
+## 1.7.0+moonawn.6 (unreleased fork candidate)
+
+- Skip gateway monkey patches, Feishu client pre-warm, and message-hook registration when Hermes loads the plugin in its dashboard-only process. This removes a false `gateway.run did not become ready within 60s` error without weakening the gateway process patches.
+
 ## 1.7.0+moonawn.5 (unreleased fork candidate)
 
 - 将 `final_delivery: card` 明确为本 fork 推荐展示：reasoning/tool、流式正文与权威终稿在同一 CardKit 内完成，正常路径不再追加常规消息；完整普通消息仅作为 CardKit 建卡、写终稿或封卡失败时的无损兜底。

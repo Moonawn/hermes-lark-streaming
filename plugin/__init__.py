@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 import yaml
 
@@ -45,6 +46,17 @@ _DEFAULT_STREAMING_CONFIG: dict[str, Any] = {
 
 # Hold strong refs to pre-warm tasks (prevent GC per Python docs)
 _prewarm_tasks: set = set()
+
+
+def _is_dashboard_process(argv: Sequence[str] | None = None) -> bool:
+    """Return true when Hermes is loading plugins for the dashboard only.
+
+    The dashboard container shares the agent's plugin and log directories but
+    never imports ``gateway.run``.  Starting gateway patch waiters there creates
+    a false timeout error 60 seconds after every dashboard restart.
+    """
+    process_argv = tuple(sys.argv if argv is None else argv)
+    return len(process_argv) > 1 and process_argv[1] == "dashboard"
 
 def _backup_config() -> None:
     """Back up config.yaml once per install (skips if a backup already exists)."""
@@ -174,6 +186,14 @@ def register(ctx: "PluginContext") -> None:
         )
     except Exception:
         _logger.debug("config diagnostic log failed", exc_info=True)
+
+    if _is_dashboard_process():
+        _logger.info(
+            "hermes-lark-streaming v%s: dashboard process detected; "
+            "skipping gateway patches, Feishu pre-warm, and message hooks",
+            __version__,
+        )
+        return
 
     _logger.info("hermes-lark-streaming v%s: applying runtime patches...", __version__)
     try:
