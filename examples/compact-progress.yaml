@@ -1,3 +1,5 @@
+# ALTERNATIVE split presentation. The recommended continuous mode is
+# examples/single-card-streaming.yaml.
 # Merge into a TEST Profile's config.yaml; never replace its whole config.
 # Credentials and real chat IDs belong only in the private Profile.
 hermes_lark_streaming:

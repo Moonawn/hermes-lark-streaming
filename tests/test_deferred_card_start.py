@@ -21,7 +21,11 @@ from hermes_lark_streaming.state.linear import UnifiedLinearState
 from tests.test_controller import _mock_client
 
 
-def _controller(*, first_answer: bool = True) -> StreamCardController:
+def _controller(
+    *,
+    first_answer: bool = True,
+    separate_final: bool = False,
+) -> StreamCardController:
     cfg = Config()
     cfg._raw = {
         "feishu": {"app_id": "app", "app_secret": "secret"},
@@ -29,6 +33,9 @@ def _controller(*, first_answer: bool = True) -> StreamCardController:
             "enabled": True,
             "streaming_card_start": (
                 "first_answer" if first_answer else "message_start"
+            ),
+            "final_delivery": (
+                "separate_message" if separate_final else "card"
             ),
         },
     }
@@ -129,8 +136,8 @@ async def test_answer_embedded_in_thinking_callback_also_activates_card() -> Non
     await _finish_pending(ctrl)
 
 
-def test_final_without_delta_skips_late_card_and_yields_gateway() -> None:
-    ctrl = _controller()
+def test_final_without_delta_in_separate_mode_yields_gateway() -> None:
+    ctrl = _controller(separate_final=True)
     with patch.object(ctrl, "_complete_session") as complete:
         ctrl.on_message_started(message_id="event-final-only", chat_id="chat")
         handled = ctrl.on_completed(
@@ -147,6 +154,41 @@ def test_final_without_delta_skips_late_card_and_yields_gateway() -> None:
     assert not session.card_id
     complete.assert_not_called()
     ctrl._client.cardkit_create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_final_without_delta_in_single_card_mode_publishes_and_seals() -> None:
+    ctrl = _controller()
+    ctrl.on_message_started(message_id="event-final-card", chat_id="chat")
+    session = ctrl._sess_get("event-final-card")
+    assert session is not None and session.state == IDLE
+
+    handled = ctrl.on_completed(
+        message_id="event-final-card",
+        answer="provider returned only a final END",
+    )
+
+    assert handled is True
+    assert session.state == COMPLETING
+    await asyncio.wait_for(session._card_ready.wait(), timeout=1)
+    assert session.completion_task is not None
+    await asyncio.wait_for(asyncio.shield(session.completion_task), timeout=1)
+    await _finish_pending(ctrl)
+
+    ctrl._client.cardkit_create.assert_awaited_once()
+    ctrl._client.reply_card_by_id.assert_awaited_once()
+    ctrl._client.reply_text.assert_not_awaited()
+    assert session.state == COMPLETED
+    assert session.final_answer == "provider returned only a final END"
+
+    final_contents = [
+        action.get("params", {}).get("partial_element", {}).get("content")
+        for call in ctrl._client.cardkit_batch_update.await_args_list
+        for action in call.args[1]
+        if action.get("params", {}).get("element_id") == "answer_content"
+    ]
+    assert "provider returned only a final END" in final_contents
+    ctrl._client.cardkit_close_streaming.assert_awaited_once()
 
 
 def test_stop_during_preflight_has_no_card_wait_or_orphan() -> None:

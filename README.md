@@ -4,7 +4,7 @@
 
 An independently maintained fork of [Aowen-Nowor/hermes-lark-streaming](https://github.com/Aowen-Nowor/hermes-lark-streaming), based on upstream **v1.7.0** (`aef71a8`). The upstream project in turn credits [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming). Original attribution and the MIT license are retained.
 
-**Development candidate: `1.7.0+moonawn.4`. No stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a calmer reading experience. It is a Hermes plugin, not a Codex plugin.
+**Development candidate: `1.7.0+moonawn.5`. No stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a continuous single-card reading experience. It is a Hermes plugin, not a Codex plugin.
 
 ## What changes
 
@@ -12,8 +12,9 @@ An independently maintained fork of [Aowen-Nowor/hermes-lark-streaming](https://
 - Card creation, updates and sealing share one writer. An old ACK cannot clear a newer answer revision; CardKit publication retries reuse one UUID so an accepted request with a lost ACK does not create a second loading card.
 - Completion has a deadline for every chat. Cancellation releases waiters and ends the session; an orphaned completion does not live forever. A failed card gets a bounded attempt to close its typing animation.
 - Legacy text fallback retains the complete answer, splits it without dropping separators, and reuses per-turn, per-part UUIDs on retry.
-- Optional **separate final delivery** keeps progress-card status independent of final-message delivery. Native failed chunks cannot be hidden behind a later successful chunk.
-- Optional **compact progress cards** show status and collapsible tool activity; the full answer stays in a separate message.
+- Recommended **single-card completion** keeps reasoning/tool progress, streamed answer text, and the authoritative final in one CardKit message. A normal turn publishes one card; a lossless plain-message fallback is used only after card delivery fails.
+- Optional **separate final delivery** remains available for deployments that require native-message read-back, but it is no longer this fork's recommended presentation.
+- Optional **compact progress cards** apply only to separate-message delivery; the full answer then stays in another message.
 - Experimental native Feishu **verified delivery** stages the original final and planned payloads in a private SQLite outbox, validates the destination, and reads back every acknowledged message body. It resumes persisted work rather than rerunning the model.
 - Optional per-chat queues retain individual messages and check for withdrawn queued messages. No chat is serialized unless explicitly configured.
 - Feishu reply routing is normalized before Hermes derives the session and delivery metadata: a synthetic `thread_id` on an ordinary reply is removed, while a genuine topic thread is preserved.
@@ -26,15 +27,15 @@ Upstream v1.7.0's relay support, schema-error recovery, Markdown escape cache an
 
 | Mode | Process card | Final answer | Intended use |
 | --- | --- | --- | --- |
-| Default / legacy | Full streamed body and tools | Same card; lossless text fallback if necessary | Compatibility |
+| Single-card stream (recommended) | Full streamed body and tools | Same card; lossless text fallback if necessary | Continuous reading |
 | Separate + full | Full streamed preview | Independent native message | Keep the typing experience |
 | Separate + compact | Short status and collapsible tools | Independent native message | Long answers and busy groups |
 
-Set `streaming_card_start: first_answer` to keep preflight/compression outside the streaming card. The first published card already contains the answer element, so it starts at “Writing…” without flashing a stale “loading context” hint. The default `message_start` behavior remains compatible with existing Profiles.
+The recommended pair is `final_delivery: card` plus `streaming_card_start: first_answer`. Preflight/compression stays outside the main card; the first answer content creates one CardKit message, reasoning/tools and body continue there, and the authoritative final replaces the same answer element before sealing. A provider that emits only a final still creates and seals that final in one card. The default `message_start` behavior remains compatible with existing Profiles.
 
-The card's “Final answer follows” label describes generation and the next delivery step; it is **not** a delivery receipt. `verified` means the read-back matches the expected outbound payload; it does not prove a person read the message or that every client rendered it identically.
+On the normal single-card path, the gateway reply is suppressed only after CardKit owns completion; create, final-write, or seal failure triggers the full text fallback instead of silently losing the answer. In separate mode, “Final answer follows” describes the next message and is **not** a delivery receipt.
 
-Merge [the compact example](examples/compact-progress.yaml) into a **test Profile**, not over an existing configuration. To retain streamed body text, set `progress_card: full`. Experimental verified delivery is a separate opt-in; see [the verified example](examples/verified-native-delivery.yaml) and [its limits](docs/MAINTENANCE.md#verified-delivery).
+Merge [the single-card example](examples/single-card-streaming.yaml) into a **test Profile**, not over an existing configuration. Separate compact progress is an alternative in [the compact example](examples/compact-progress.yaml). Experimental verified delivery is a separate-message opt-in; see [the verified example](examples/verified-native-delivery.yaml) and [its limits](docs/MAINTENANCE.md#verified-delivery).
 
 ## Develop and test
 

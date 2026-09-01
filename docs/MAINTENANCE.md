@@ -17,11 +17,13 @@
 
 ## 展示策略
 
-`final_delivery: separate_message` 将过程卡与正文分离。`progress_card: compact` 只在该模式生效，避免把兼容模式中唯一的正文隐藏。推荐收起过程面板，关闭 reasoning 展示；想看逐步正文时使用 `progress_card: full`，并适当调低刷新频率。
+本 fork 推荐 `final_delivery: card`：reasoning/tool 面板、逐步正文和权威终稿都属于同一张 CardKit。正常路径只发布一张卡；完成时先把权威终稿写入原 answer 元素，再封闭 streaming。只有建卡、终稿写入或封卡失败时，才以完整普通消息兜底，避免静默丢答。
 
-`streaming_card_start: first_answer` 会在首段 answer 内容出现时才创建 CardKit 卡片。compression progress 仍由 Hermes 通过普通 gateway 状态消息展示；reasoning 与 tool 事件先缓存在内存，主卡创建后再统一刷新。若 provider 只有 final 而没有 delta，或用户在压缩期停止/发来新消息，本轮不会事后补建一张没有阅读价值的流式卡，最终正文交回 gateway。默认 `message_start` 保持旧行为。
+`final_delivery: separate_message` 是可选替代方案，会主动把过程卡与正文分离。`progress_card: compact` 只在该模式生效，避免把单卡模式中的唯一正文隐藏。需要原生消息回读时可以选择该模式，但它不具备单卡流式的连续阅读体验。
 
-配置初值：正文刷新 800ms、面板刷新 1000ms。它们是易读性起点，不是平台限流保证；高并发仍需观察错误率和时延。紧凑模式以“生成完成 · Final answer follows”明确提示独立正文仍在后续投递，不改变保存的终稿，也不把过程状态当交付回执。
+`streaming_card_start: first_answer` 会在首段 answer 内容出现时才创建 CardKit 卡片。compression progress 仍由 Hermes 通过普通 gateway 状态消息展示；reasoning 与 tool 事件先缓存在内存，主卡创建后再统一刷新。若 provider 只有 final 而没有 delta，单卡模式会把该 final 视为首个答案内容，创建并立即封定唯一卡片；独立答复模式仍跳过迟到过程卡并交回 gateway。用户在压缩期停止或发来新消息时不会留下加载占位卡。默认 `message_start` 保持旧行为。
+
+配置初值：正文刷新 800ms、面板刷新 1000ms。它们是易读性起点，不是平台限流保证；高并发仍需观察错误率和时延。单卡模式的 CardKit batch update/close ACK 表明平台接受了对应写入，不等于用户已读；紧凑独立模式中的“生成完成 · Final answer follows”只表示另一条正文仍在后续投递。
 
 卡片实体创建后还要经过一次 IM 发布。发布请求对同一次重试链复用 UUID；即使服务端已经接收而客户端丢失 ACK，也不会因为插件内部重试产生两张加载卡。进程在卡片创建与发布之间崩溃仍可能留下不可见的 CardKit 实体；进程在卡片已经可见后永久挂起或退出，也可能留下未关闭的“生成中”卡片，当前内存态插件无法在重启后恢复这类卡片生命周期。
 

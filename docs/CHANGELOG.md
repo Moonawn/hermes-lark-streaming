@@ -1,3 +1,9 @@
+## 1.7.0+moonawn.5 (unreleased fork candidate)
+
+- 将 `final_delivery: card` 明确为本 fork 推荐展示：reasoning/tool、流式正文与权威终稿在同一 CardKit 内完成，正常路径不再追加常规消息；完整普通消息仅作为 CardKit 建卡、写终稿或封卡失败时的无损兜底。
+- `streaming_card_start: first_answer` 与单卡模式组合时，provider 只有 final、没有 answer delta 也会创建并封定唯一终稿卡；独立答复模式仍跳过没有阅读价值的迟到过程卡。
+- 新增 `examples/single-card-streaming.yaml`，将 split/compact 与 verified delivery 标注为有意分成两条消息的替代模式。
+
 ## 1.7.0+moonawn.4 (unreleased fork candidate)
 
 - 新增可选 `streaming_card_start: first_answer`：preflight context compression 期间不创建 CardKit 主流式卡，首段 answer 到达后直接发布带回答元素的卡片，避免“加载上下文”晚闪与长时间暴露。

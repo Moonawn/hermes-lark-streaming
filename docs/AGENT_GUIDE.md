@@ -2,7 +2,7 @@
 
 本文件描述本 fork。原作者的仓库、Gitee 同步和 PyPI 包不是本 fork 的发布渠道。
 
-当前开发候选为 `1.7.0+moonawn.4`。Python 需要 3.11 或更高；CardKit SDK 至少为 `lark-oapi>=1.4.24`。不要仅根据版本号大小就覆盖已有的私有修复。
+当前开发候选为 `1.7.0+moonawn.5`。Python 需要 3.11 或更高；CardKit SDK 至少为 `lark-oapi>=1.4.24`。不要仅根据版本号大小就覆盖已有的私有修复。
 
 ## 先在独立环境验证
 
@@ -10,7 +10,7 @@
 2. 运行 `python scripts/test_offline.py tests -q`，再用目标 Hermes 版本运行原生 adapter 兼容测试。依赖见 `requirements-test.txt`。
 3. 为 canary 建立独立 Profile，只在私有配置中放入操作者选择的测试 bot 和测试群。不要复制生产 Profile、历史或数据库进仓库。
 4. 将审核后的代码作为该 Profile 唯一一份 `hermes-lark-streaming` 插件加载。保留旧插件目录和配置备份，避免修改共享目录影响其他 bot。
-5. 合并 `examples/compact-progress.yaml` 中所需选项。原生回读校验是实验性功能，应在基础独立答复模式验证后再开启。
+5. 推荐先合并 `examples/single-card-streaming.yaml` 中所需选项，验证正文始终在同一 CardKit 内流式并完成。独立答复与原生回读校验属于替代模式，应单独评估后再开启。
 6. 仅在操作者授权的测试渠道进行真实发送，按下方验收。现有网关的部署与重启按当前授权范围执行，不自动扩散到其他 Profile。
 
 ## 真实环境验收

@@ -4,7 +4,7 @@
 
 这是 [Aowen-Nowor/hermes-lark-streaming](https://github.com/Aowen-Nowor/hermes-lark-streaming) 的独立 fork，基于上游 **v1.7.0 / `aef71a8`**。上游亦基于 [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming) 发展而来，原有署名与 MIT 许可证保留。此项目是 Hermes 插件，不是 Codex 插件。
 
-**当前是开发候选 `1.7.0+moonawn.4`，尚未发布稳定版。** 维护重点是终稿完整送达、流式任务可靠收尾，以及更安静、易读的展示。
+**当前是开发候选 `1.7.0+moonawn.5`，尚未发布稳定版。** 维护重点是终稿完整送达、流式任务可靠收尾，以及连续、易读的单卡体验。
 
 ## 已加入的修正
 
@@ -12,8 +12,9 @@
 - **更新顺序**：同一卡片的创建、刷新、收尾共用一个 writer；旧 ACK 不会清掉新内容的待刷新标记；CardKit 发布重试复用同一 UUID，服务端已接收但客户端丢 ACK 时不会再产生第二张加载卡。
 - **超时与取消**：所有聊天都受收尾时限保护；取消释放等待者、结束生命周期，过期的收尾任务可以回收。失败卡片会尝试停止服务端打字动画，此动作也有时限。
 - **无损兜底**：按片段发送完整正文，保留分隔符；重试复用同一轮、同一片段的 UUID，不再只截取开头。
-- **独立答复**：可将过程卡和最终消息分开。卡片存在不代表正文已送达，前一片段失败也不会被后一片段的成功掩盖。
-- **紧凑显示**：可只保留短状态与可折叠工具过程，完整正文放在独立答复里，减少长卡片跳动。
+- **单卡完成**：推荐让 CardKit 同时承载 reasoning/tool 过程、逐步正文和权威终稿；正常完成只产生一张卡，封卡失败才发送无损普通消息兜底。
+- **可选独立答复**：仍可将过程卡和最终消息分开；它适合需要原生消息回读的特殊部署，不再作为本 fork 的推荐展示。
+- **可选紧凑显示**：仅在独立答复模式中保留短状态与可折叠工具过程，完整正文放在另一条消息里。
 - **实验性回读校验**：原生 Feishu adapter 可先保存终稿和待发送载荷，再逐条回读消息正文；异常恢复使用已保存内容，不重新调用模型。
 - **可选群内队列**：按明确配置的群串行处理，保留独立入站消息，检查排队期间被撤回的消息；默认不改变群的并发策略。
 - **引用回复路由**：在 Hermes 计算 session 与投递 metadata 前清除普通 Feishu 引用回复携带的伪 `thread_id`，真实话题 thread 保持不变。
@@ -26,15 +27,15 @@
 
 | 模式 | 过程卡 | 最终正文 |
 | --- | --- | --- |
-| 默认兼容模式 | 完整流式正文和工具过程 | 原卡片，必要时文本兜底 |
+| 单卡流式（推荐） | 完整流式正文和工具过程 | 同一张卡片，必要时文本兜底 |
 | 独立答复 + full | 保留流式正文预览 | 另发独立答复 |
 | 独立答复 + compact | 短状态、可折叠工具过程 | 另发独立答复，适合长文与多人群 |
 
-配置 `streaming_card_start: first_answer` 后，preflight/compression 阶段不创建主流式卡；首张主卡直接带回答元素，从“正在生成答复”开始，不再短暂闪回“正在加载上下文”。默认值仍是兼容旧 Profile 的 `message_start`。
+推荐同时配置 `final_delivery: card` 与 `streaming_card_start: first_answer`。preflight/compression 阶段不创建主流式卡；首段正文到达后创建唯一 CardKit，reasoning/tool 与正文在其中持续更新，权威终稿覆盖同一个 answer 元素并封卡。provider 只有 final、没有 delta 时，单卡模式也会直接创建并封定该终稿。默认 `message_start` 仍兼容旧 Profile。
 
-紧凑模式中的“生成完成 · Final answer follows”表示正文将由独立消息承载，**不等于正文送达回执**。回读状态 `verified` 表示服务端正文与预期发送载荷一致，不代表用户已阅读，也不保证不同客户端的排版完全相同。
+正常单卡路径在 CardKit 的最终 batch update 与 close ACK 成功后抑制 gateway 普通回复；若建卡、写终稿或封卡失败，插件才发送完整文本兜底，避免为了保持形式而静默丢答。独立答复模式中的“生成完成 · Final answer follows”只表示另一条正文即将投递，**不等于正文送达回执**。
 
-将 [紧凑配置示例](examples/compact-progress.yaml) 合并到测试 Profile 的现有配置，不要整份覆盖。希望继续看正文流式预览时，把 `progress_card` 改成 `full`。回读校验另行显式启用，见 [示例](examples/verified-native-delivery.yaml) 与 [边界说明](docs/MAINTENANCE.md#verified-delivery)。
+将 [单卡配置示例](examples/single-card-streaming.yaml) 合并到测试 Profile 的现有配置，不要整份覆盖。过程卡与正文分离是可选替代方案，见 [紧凑示例](examples/compact-progress.yaml)；回读校验另行显式启用，见 [示例](examples/verified-native-delivery.yaml) 与 [边界说明](docs/MAINTENANCE.md#verified-delivery)。
 
 ## 开发验证
 

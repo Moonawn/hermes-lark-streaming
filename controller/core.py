@@ -1054,27 +1054,43 @@ class StreamCardController(ControllerMixin, UnifiedControllerMixin):
         }
 
         # Some providers return an authoritative final without ever emitting
-        # an answer delta. A progress card created after generation would
-        # flash late and add no value, so intentionally skip it and let the
-        # gateway deliver the final text. This also bounds compression-only
-        # failures without waiting on _card_ready.
+        # an answer delta.  In separate-message mode a late progress card adds
+        # no value, so the gateway still owns that final.  In card-owned mode,
+        # however, the final itself is the first answer content: publish one
+        # card and seal the authoritative text there instead of unexpectedly
+        # changing the response shape to a plain message.
         if (
             session.defer_card_until_answer
             and session.state == IDLE
             and not session._card_activation_requested
         ):
-            self._finish_without_streaming_card(
-                session,
-                aborted=aborted,
-                error=bool(error_message) and not aborted,
-                source="completed_before_answer_delta",
+            card_owns_final = bool(
+                session.final_answer
+                and not aborted
+                and not self._cfg.independent_final_delivery
             )
-            _logger.info(
-                "HLS: no answer delta; skipped late streaming card and yielded "
-                "final to gateway msg=%s",
-                (message_id or "?")[:12],
-            )
-            return False
+            if card_owns_final and self._request_linear_card(
+                session, source="completed_final"
+            ):
+                _logger.info(
+                    "HLS: no answer delta; publishing authoritative final in "
+                    "single card msg=%s",
+                    (message_id or "?")[:12],
+                )
+            else:
+                if not session.is_terminal_phase:
+                    self._finish_without_streaming_card(
+                        session,
+                        aborted=aborted,
+                        error=bool(error_message) and not aborted,
+                        source="completed_before_answer_delta",
+                    )
+                _logger.info(
+                    "HLS: no answer delta; skipped late streaming card and yielded "
+                    "final to gateway msg=%s",
+                    (message_id or "?")[:12],
+                )
+                return False
 
         if session.unified_state is not None:
             session.unified_state.freeze_answer()
