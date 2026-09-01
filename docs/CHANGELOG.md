@@ -1,3 +1,10 @@
+## 1.7.0+moonawn.7 (unreleased fork candidate)
+
+- Hermes gateway status callback 会在 worker thread 创建 coroutine 时携带原始 Feishu turn 标识，避免切换到 gateway loop 后丢失 ContextVar 归属。
+- HLS 已接管的 turn 会吸收 preflight compression、provider retry 和迟到状态 callback；这些状态不再绕过主卡生成多条普通消息，也不会在答案卡完成后追加第二张错误/状态卡。
+- 推荐单卡配置改为 `final_delivery: card` + `streaming_card_start: message_start`：一张卡从准备提示持续到 reasoning/tool、流式正文、权威终稿与封卡。`first_answer` 仍可选，但短回答可能接近瞬时完成。
+- 准备提示改为“正在整理上下文并准备回答…”，并增加 exact-turn、终态迟到 callback、旧 Hermes 无 metadata 兼容及不相关手工状态透传的回归测试。
+
 ## 1.7.0+moonawn.6 (unreleased fork candidate)
 
 - Skip gateway monkey patches, Feishu client pre-warm, and message-hook registration when Hermes loads the plugin in its dashboard-only process. This removes a false `gateway.run did not become ready within 60s` error without weakening the gateway process patches.

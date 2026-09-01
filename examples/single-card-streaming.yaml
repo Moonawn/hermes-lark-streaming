@@ -3,12 +3,12 @@
 hermes_lark_streaming:
   enabled: true
   final_delivery: card
-  streaming_card_start: first_answer  # compression stays outside the main card
+  streaming_card_start: message_start # one card owns preparation through completion
   verified_delivery: false            # verified delivery is separate-message only
   card_completion_timeout_sec: 10
-  answer_flush_interval_ms: 800
-  flush_interval_ms: 1000
-  print_strategy: fast
+  answer_flush_interval_ms: 500
+  flush_interval_ms: 800
+  print_strategy: delay
   streaming_panel_expanded: false
   panel_expanded: false
   max_tool_steps: 8

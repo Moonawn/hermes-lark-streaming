@@ -14,6 +14,9 @@ from typing import Any
 
 from .. import __version__
 from . import (
+    _HLS_STATUS_DELIVERY_KEY,
+    _HLS_STATUS_KEY,
+    _HLS_STATUS_TURN_KEY,
     _gateway_cards,
     _gateway_cards_lock,
     _get_config,
@@ -29,6 +32,80 @@ _CARD_REPLY_CONTEXT_MAX = 500
 _CARD_REPLY_CONTEXT_CHARS = 2000
 _card_reply_contexts: OrderedDict[str, str] = OrderedDict()
 _card_reply_contexts_lock = threading.Lock()
+
+_COMPRESSION_LIFECYCLE_RE = re.compile(
+    r"(?:"
+    r"pre(?:flight|-api| api)\s+compression"
+    r"|compacting\s+context"
+    r"|context\s+compaction\s+complete"
+    r"|context\s+compression\s+timed\s+out"
+    r"|context\s+is\s+over\s+the\s+compression\s+threshold"
+    r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
+    r"|context\s+too\s+large\s+\(~?[\d,]+\s+tokens\)"
+    r"|compressed\s+~?[\d,]+\s+(?:→|->)\s+~?[\d,]+\s+"
+      r"(?:messages|tokens),\s+retrying"
+    r"|context\s+reduced\s+to\s+[\d,]+\s+tokens"
+    r"|session\s+compressed\s+\d+\s+times"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_compression_lifecycle_message(content: str) -> bool:
+    """Recognize automatic compression chatter, excluding manual feedback."""
+    return bool(
+        isinstance(content, str)
+        and _COMPRESSION_LIFECYCLE_RE.search(content)
+    )
+
+
+def _status_session_for_turn(ctrl: Any, chat_id: str, metadata: Any) -> Any:
+    """Resolve an HLS session for a tagged lifecycle/status delivery.
+
+    Prefer the captured inbound message id.  If an older Hermes build loses
+    that context, use an unambiguous active session in the same chat.  Terminal
+    sessions are accepted only by exact id so a late callback from the just
+    finished turn is swallowed without hiding a later manual ``/compress``.
+    """
+    candidate_ids: list[str] = []
+    if isinstance(metadata, dict):
+        for key in (_HLS_STATUS_TURN_KEY, "reply_to_message_id"):
+            value = str(metadata.get(key) or "")
+            if value and value not in candidate_ids:
+                candidate_ids.append(value)
+    ctx = _msg_ctx.get(None)
+    if isinstance(ctx, dict):
+        value = str(ctx.get("event_message_id") or ctx.get("message_id") or "")
+        if value and value not in candidate_ids:
+            candidate_ids.append(value)
+
+    for message_id in candidate_ids:
+        try:
+            session = ctrl._sess_get(message_id)
+        except Exception:
+            session = None
+        if session is not None and str(getattr(session, "chat_id", "")) == chat_id:
+            return session
+
+    try:
+        sessions = ctrl._sess_values_snapshot()
+    except Exception:
+        sessions = []
+    unique: list[Any] = []
+    seen: set[int] = set()
+    for session in sessions or []:
+        if id(session) in seen:
+            continue
+        seen.add(id(session))
+        if str(getattr(session, "chat_id", "")) != chat_id:
+            continue
+        try:
+            terminal = bool(session.is_terminal_phase)
+        except Exception:
+            terminal = False
+        if not terminal:
+            unique.append(session)
+    return unique[0] if len(unique) == 1 else None
 
 
 def _normalize_card_reply_context(answer: str) -> str:
@@ -210,6 +287,47 @@ async def _dispatch_feishu_outbound(
         return await passthrough()
 
     _text_content = content
+
+    # ── Turn lifecycle/status lane ──
+    # Hermes status callbacks (preflight compression, compacting, provider
+    # retry/auth notices, progress) are operational edges of the current turn,
+    # not additional replies.  Publishing them through FeishuAdapter.send used
+    # to create several text bubbles before a first-answer card, and a late
+    # callback could create a second static error card after the answer card.
+    # Keep them owned by the exact HLS session.  ``message_start`` mode already
+    # shows a loading hint inside that one card; final failures are rendered by
+    # the normal completion/error panel or lossless text fallback.
+    _marked_status = bool(
+        isinstance(metadata, dict)
+        and metadata.get(_HLS_STATUS_DELIVERY_KEY)
+    )
+    _compression_status = _is_compression_lifecycle_message(_text_content)
+    if _marked_status or _compression_status:
+        try:
+            from ..controller import get_controller
+
+            _status_ctrl = get_controller()
+            _status_session = (
+                _status_session_for_turn(_status_ctrl, str(chat_id or ""), metadata)
+                if _status_ctrl and _status_ctrl.enabled
+                else None
+            )
+            if _status_session is not None:
+                _logger.info(
+                    "HLS: absorbed turn status into single-card lifecycle "
+                    "msg=%s state=%s kind=%s",
+                    str(getattr(_status_session, "message_id", "") or "?")[:12],
+                    str(getattr(_status_session, "state", "unknown")),
+                    str(metadata.get(_HLS_STATUS_KEY) or "compression")
+                    if isinstance(metadata, dict)
+                    else "compression",
+                )
+                return _send_result_ok()
+        except Exception:
+            _logger.debug(
+                "HLS: turn status ownership lookup failed",
+                exc_info=True,
+            )
 
     if getattr(adapter, "_hls_cron_sending", 0) or getattr(adapter, "_hls_bg_sending", 0):
         return await passthrough()

@@ -26,6 +26,9 @@ __all__ = [
     '_started_msg_ids_lock',
     '_gateway_cards',
     '_gateway_cards_lock',
+    '_HLS_STATUS_DELIVERY_KEY',
+    '_HLS_STATUS_KEY',
+    '_HLS_STATUS_TURN_KEY',
     '_gw_runner_patched',
     '_patch_status',
     # v1.4.0: FeishuAdapter patched-class registry (deferred loading fix)
@@ -57,6 +60,7 @@ __all__ = [
     '_wrap_run_background_task',
     '_wrap_cron_deliver',
     '_wrap_run_conversation',
+    '_wrap_send_or_update_status',
     # From callbacks
     '_maybe_wrap_callbacks',
     # From adapter
@@ -114,6 +118,14 @@ _started_msg_ids_lock = threading.Lock()
 
 _gateway_cards: dict[str, dict[str, Any]] = {}
 _gateway_cards_lock = threading.Lock()
+
+# Private metadata attached to Hermes gateway status callbacks.  Feishu
+# ignores unknown metadata, while the HLS adapter wrapper uses these fields to
+# keep lifecycle/progress notices inside the current single-card turn instead
+# of publishing separate text messages or gateway cards.
+_HLS_STATUS_DELIVERY_KEY = "_hls_status_delivery"
+_HLS_STATUS_KEY = "_hls_status_key"
+_HLS_STATUS_TURN_KEY = "_hls_turn_message_id"
 
 _gw_runner_patched: bool = False
 
@@ -183,6 +195,7 @@ from .gateway import (  # noqa: E402
     _wrap_run_background_task,
     _wrap_cron_deliver,
     _wrap_run_conversation,
+    _wrap_send_or_update_status,
 )
 from .callbacks import (  # noqa: E402
     _maybe_wrap_callbacks,
@@ -250,6 +263,27 @@ def _apply_gateway_runner_patches() -> bool:
         # Patch each method individually so one missing method
         # doesn't prevent the others from being patched.
         _patched_methods = []
+
+        # Hermes sends compression/provider lifecycle notices through this
+        # module-level helper.  Tag those sends at the worker-thread call site
+        # so FeishuAdapter.send can associate them with the exact HLS turn.
+        # A normal def wrapper is intentional: it captures the ContextVar /
+        # thread-local before the coroutine is scheduled on the gateway loop.
+        _gateway_module = sys.modules.get("gateway.run")
+        _status_sender = getattr(
+            _gateway_module, "_send_or_update_status_coro", None
+        ) if _gateway_module is not None else None
+        if callable(_status_sender):
+            if not getattr(_status_sender, "_hls_status_metadata", False):
+                _gateway_module._send_or_update_status_coro = (
+                    _wrap_send_or_update_status(_status_sender)
+                )
+            _patched_methods.append('_send_or_update_status_coro')
+        else:
+            _logger.info(
+                "hermes-lark-streaming: gateway status sender not available; "
+                "status metadata patch skipped"
+            )
         if hasattr(GatewayRunner, '_handle_message'):
             GatewayRunner._handle_message = _wrap_handle_message(GatewayRunner._handle_message)
             _patched_methods.append('_handle_message')

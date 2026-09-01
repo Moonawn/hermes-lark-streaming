@@ -4,7 +4,7 @@
 
 这是 [Aowen-Nowor/hermes-lark-streaming](https://github.com/Aowen-Nowor/hermes-lark-streaming) 的独立 fork，基于上游 **v1.7.0 / `aef71a8`**。上游亦基于 [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming) 发展而来，原有署名与 MIT 许可证保留。此项目是 Hermes 插件，不是 Codex 插件。
 
-**当前是开发候选 `1.7.0+moonawn.6`，尚未发布稳定版。** 维护重点是终稿完整送达、流式任务可靠收尾，以及连续、易读的单卡体验。
+**当前是开发候选 `1.7.0+moonawn.7`，尚未发布稳定版。** 维护重点是终稿完整送达、流式任务可靠收尾，以及连续、易读的单卡体验。
 
 ## 已加入的修正
 
@@ -19,7 +19,8 @@
 - **可选群内队列**：按明确配置的群串行处理，保留独立入站消息，检查排队期间被撤回的消息；默认不改变群的并发策略。
 - **引用回复路由**：在 Hermes 计算 session 与投递 metadata 前清除普通 Feishu 引用回复携带的伪 `thread_id`，真实话题 thread 保持不变。
 - **压缩状态防误报**：若 Hermes 的 commit fence 已取消压缩提交，抑制后台清理阶段迟到的“compaction complete”成功提示；正常完成提示不变。
-- **首个答案再开流**：可让 preflight compression 只显示普通状态消息，直到出现 answer 内容才创建 CardKit 流式卡；仅返回 final、压缩期停止或被新消息打断时，不留下加载占位卡。
+- **状态归属单卡**：Hermes 的 preflight compression、provider retry 与迟到状态 callback 会绑定到原始 turn，由该轮 CardKit 生命周期吸收，不再在答案旁生成普通消息或第二张状态卡。
+- **可选首个答案再开流**：仍可等到出现 answer 内容才创建 CardKit；适合更在意占位卡存续时间的部署，但短回答可能一出现就接近完整，不是本 fork 推荐的连续单卡体验。
 
 保留上游 v1.7.0 的 relay 支持、schema 错误恢复、Markdown 缓存与面板记录上限。
 
@@ -31,7 +32,9 @@
 | 独立答复 + full | 保留流式正文预览 | 另发独立答复 |
 | 独立答复 + compact | 短状态、可折叠工具过程 | 另发独立答复，适合长文与多人群 |
 
-推荐同时配置 `final_delivery: card` 与 `streaming_card_start: first_answer`。preflight/compression 阶段不创建主流式卡；首段正文到达后创建唯一 CardKit，reasoning/tool 与正文在其中持续更新，权威终稿覆盖同一个 answer 元素并封卡。provider 只有 final、没有 delta 时，单卡模式也会直接创建并封定该终稿。默认 `message_start` 仍兼容旧 Profile。
+推荐同时配置 `final_delivery: card` 与 `streaming_card_start: message_start`。用户消息开始处理时即出现一张带中性准备提示的 CardKit；之后 reasoning/tool、逐步正文、权威终稿和完成状态都由这张卡承载。自动压缩与 provider 生命周期 callback 绑定到该轮，不再另发普通状态消息。provider 只有 final、没有 delta 时，也会在同一卡片内替换提示并封定终稿。
+
+`streaming_card_start: first_answer` 仍可用于不希望长时间显示占位卡的环境；它会缓存 reasoning/tool，直到首段正文才开卡，因此短回答可能看起来像瞬间完成。HLS 已接管该轮时，生命周期状态同样不会另发消息。
 
 正常单卡路径在 CardKit 的最终 batch update 与 close ACK 成功后抑制 gateway 普通回复；若建卡、写终稿或封卡失败，插件才发送完整文本兜底，避免为了保持形式而静默丢答。独立答复模式中的“生成完成 · Final answer follows”只表示另一条正文即将投递，**不等于正文送达回执**。
 

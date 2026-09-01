@@ -11,6 +11,9 @@ from typing import Any, Callable
 from .. import __version__
 from ..state.phase import TERMINAL_PHASES
 from . import (
+    _HLS_STATUS_DELIVERY_KEY,
+    _HLS_STATUS_KEY,
+    _HLS_STATUS_TURN_KEY,
     _get_config,
     _msg_ctx,
     _started_msg_ids,
@@ -24,6 +27,67 @@ _chat_serial_locks: dict[tuple[int, str], asyncio.Lock] = {}
 _chat_serial_owners: dict[tuple[int, str], asyncio.Task[Any] | None] = {}
 _chat_serial_locks_guard = threading.Lock()
 _UNAVAILABLE_MESSAGE_CODES = {230011, 231003, 1000023}
+
+
+def _wrap_send_or_update_status(orig: Callable) -> Callable:
+    """Tag one Hermes status send with its originating Feishu turn.
+
+    ``TurnRunner._status_callback_sync`` runs on the agent worker thread and
+    creates the delivery coroutine before scheduling it on the gateway event
+    loop.  Capturing the HLS ContextVar/thread-local here preserves the exact
+    inbound message id; trying to discover it later inside ``adapter.send`` is
+    racy and often sees an empty context.
+
+    Only Feishu/Lark chat ids use the ``oc_`` prefix.  Other gateway platforms
+    keep byte-for-byte metadata behavior.
+    """
+
+    @functools.wraps(orig)
+    def wrapper(adapter, chat_id, status_key, content, metadata=None):
+        if not str(chat_id or "").startswith("oc_"):
+            return orig(
+                adapter,
+                chat_id,
+                status_key,
+                content,
+                metadata=metadata,
+            )
+
+        try:
+            marked_metadata = dict(metadata or {})
+        except (TypeError, ValueError):
+            return orig(
+                adapter,
+                chat_id,
+                status_key,
+                content,
+                metadata=metadata,
+            )
+
+        ctx = _msg_ctx.get(None)
+        if ctx is None:
+            ctx = getattr(_thread_local_ctx, "data", None)
+        marked_metadata[_HLS_STATUS_DELIVERY_KEY] = True
+        marked_metadata[_HLS_STATUS_KEY] = str(status_key or "status")
+        if isinstance(ctx, dict):
+            turn_message_id = str(
+                ctx.get("event_message_id")
+                or ctx.get("message_id")
+                or ""
+            )
+            if turn_message_id:
+                marked_metadata[_HLS_STATUS_TURN_KEY] = turn_message_id
+
+        return orig(
+            adapter,
+            chat_id,
+            status_key,
+            content,
+            metadata=marked_metadata,
+        )
+
+    wrapper._hls_status_metadata = True  # type: ignore[attr-defined]
+    return wrapper
 
 
 def _is_serialized_feishu_chat(source: Any) -> bool:

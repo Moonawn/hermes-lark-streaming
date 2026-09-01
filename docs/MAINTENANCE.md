@@ -21,7 +21,9 @@
 
 `final_delivery: separate_message` 是可选替代方案，会主动把过程卡与正文分离。`progress_card: compact` 只在该模式生效，避免把单卡模式中的唯一正文隐藏。需要原生消息回读时可以选择该模式，但它不具备单卡流式的连续阅读体验。
 
-`streaming_card_start: first_answer` 会在首段 answer 内容出现时才创建 CardKit 卡片。compression progress 仍由 Hermes 通过普通 gateway 状态消息展示；reasoning 与 tool 事件先缓存在内存，主卡创建后再统一刷新。若 provider 只有 final 而没有 delta，单卡模式会把该 final 视为首个答案内容，创建并立即封定唯一卡片；独立答复模式仍跳过迟到过程卡并交回 gateway。用户在压缩期停止或发来新消息时不会留下加载占位卡。默认 `message_start` 保持旧行为。
+推荐使用 `streaming_card_start: message_start`。CardKit 在 turn 开始时显示中性的准备提示，随后由同一卡片承载 reasoning/tool、流式正文、权威终稿与完成状态。Hermes 自动产生的 compression/provider lifecycle callback 会绑定到原始 turn 并由该生命周期吸收，不再另发普通消息或第二张状态卡；最终失败仍由正常的卡片终态或无损文本兜底表达。
+
+`streaming_card_start: first_answer` 会在首段 answer 内容出现时才创建 CardKit。reasoning 与 tool 事件先缓存在内存，主卡创建后再统一刷新；短回答可能在开卡时已接近完整。若 provider 只有 final 而没有 delta，单卡模式会把该 final 视为首个答案内容，创建并立即封定唯一卡片；独立答复模式仍跳过迟到过程卡并交回 gateway。用户在压缩期停止或发来新消息时不会留下加载占位卡。
 
 配置初值：正文刷新 800ms、面板刷新 1000ms。它们是易读性起点，不是平台限流保证；高并发仍需观察错误率和时延。单卡模式的 CardKit batch update/close ACK 表明平台接受了对应写入，不等于用户已读；紧凑独立模式中的“生成完成 · Final answer follows”只表示另一条正文仍在后续投递。
 
@@ -29,7 +31,7 @@
 
 ## 长会话与 Hermes 自动压缩
 
-长会话在开始生成正文前，Hermes 会同步运行 preflight context compression。启用 `streaming_card_start: first_answer` 后，这段等待不会占用主流式卡；它缩短了卡片暴露在断线、重启和自动关闭风险下的时间，但不缩短 compression 本身。固定兼容基线 v2026.8.13、v2026.8.16.2 和 v2026.8.27 均把从 `auxiliary.compression.timeout` 读取的辅助模型超时下限钳制为 300 秒；仅把该配置写成更小的值不能缩短这段等待。摘要模型失败后还可能回退到主模型，因此用户看到的首字等待可能明显长于模型真正生成答案的时间。
+长会话在开始生成正文前，Hermes 会同步运行 preflight context compression。推荐的 `message_start` 会让用户立即看到同一张准备中卡片；`first_answer` 则在这段等待期间不显示主卡。两种模式都不缩短 compression 本身。固定兼容基线 v2026.8.13、v2026.8.16.2 和 v2026.8.27 均把从 `auxiliary.compression.timeout` 读取的辅助模型超时下限钳制为 300 秒；仅把该配置写成更小的值不能缩短这段等待。摘要模型失败后还可能回退到主模型，因此用户看到的首字等待可能明显长于模型真正生成答案的时间。
 
 Hermes 的 host wrapper 可用下面的配置限制前台等待；这是超时保护，不是压缩质量修复：
 

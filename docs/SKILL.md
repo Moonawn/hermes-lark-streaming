@@ -101,7 +101,7 @@ Background: _run_background_task ── [Hook 1/2]
 
 **4.6 统一面板架构 (v1.0.2)**: 所有推理轮次和工具步骤放在 1 个可折叠面板中（图标 `robot_filled`），回答使用 1 个流式元素。无论对话多长，卡片始终只有 3–4 个元素。面板标题动态显示 `agent loop · N rounds · M tools · Xs`。`display.show_reasoning` 控制推理内容是否出现在面板中。`panel_events` 时间线记录事件发生顺序，面板内容按时间线交错渲染。
 
-**4.7 卡片生命周期**: 默认模式保持 4 阶段渐进构建；配置 `streaming_card_start: first_answer` 时，preflight/compression 不建 CardKit 卡，首段 answer 到达后直接创建带回答元素的主卡，再进入流式更新与封卡。
+**4.7 卡片生命周期**: 推荐 `streaming_card_start: message_start`，让一张 CardKit 从准备、reasoning/tool、逐步正文一直承载到权威终稿与封卡；自动 compression/provider 状态 callback 绑定并吸收到该 turn。配置 `first_answer` 时，首段 answer 到达后才创建主卡。
 
 **4.8 卡片摘要更新 (v1.0.3)**: `close_streaming` 时同时更新 `summary.content` 和 `summary.i18n_content`（zh_cn + en_us），避免中文用户会话列表永久显示"处理中..."。
 
@@ -217,7 +217,7 @@ v1.5.0 删除 IM 降级路径（生产从未触发）。CardKit v2 创建失败�
 - `ANSWER_ELEMENT_ID` — 回答流式元素
 
 **卡片生命周期 (4 Phases)**:
-- **Phase 0（可选）** — `streaming_card_start: first_answer` 时，preflight/compression 只走普通状态消息；reasoning/tool 事件先缓存在 session，不创建 CardKit 卡
+- **Phase 0（可选）** — `streaming_card_start: first_answer` 时，preflight/compression 期间不创建 CardKit；reasoning/tool 事件先缓存在 session，自动 lifecycle 状态由该 turn 吸收
 - **Phase 1** — 默认模式在用户消息开始时创建加载占位卡；first-answer 模式在首段回答出现时直接创建含回答元素的卡
 - **Phase 2** — 默认模式在首个回答 token 删除加载提示并添加面板与回答元素；first-answer 模式直接流式写入已存在的回答元素
 - **Phase 3** — 流式更新面板内容（推理/工具）+ 回答文本
@@ -236,7 +236,7 @@ hermes_lark_streaming:
   enabled: true                    # v1.7.0 文档化：插件总开关（默认 true）
   linear: true                     # v1.7.0 文档化：线性模式（默认 true，唯一支持的路径，保留以兼容旧配置）
   gateway_cards: true              # v1.7.0 文档化：gateway 内部消息转卡片（默认 true；false 时退纯文本）
-  streaming_card_start: message_start # 可设 first_answer，把 preflight/compression 留在普通状态消息
+  streaming_card_start: message_start # 推荐：一张卡承载准备到完成；first_answer 会延后开卡
   panel_expanded: false
   streaming_panel_expanded: false
   print_strategy: delay            # "fast" 或 "delay"

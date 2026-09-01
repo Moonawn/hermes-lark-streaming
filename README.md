@@ -4,7 +4,7 @@
 
 An independently maintained fork of [Aowen-Nowor/hermes-lark-streaming](https://github.com/Aowen-Nowor/hermes-lark-streaming), based on upstream **v1.7.0** (`aef71a8`). The upstream project in turn credits [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming). Original attribution and the MIT license are retained.
 
-**Development candidate: `1.7.0+moonawn.6`. No stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a continuous single-card reading experience. It is a Hermes plugin, not a Codex plugin.
+**Development candidate: `1.7.0+moonawn.7`. No stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a continuous single-card reading experience. It is a Hermes plugin, not a Codex plugin.
 
 ## What changes
 
@@ -19,7 +19,8 @@ An independently maintained fork of [Aowen-Nowor/hermes-lark-streaming](https://
 - Optional per-chat queues retain individual messages and check for withdrawn queued messages. No chat is serialized unless explicitly configured.
 - Feishu reply routing is normalized before Hermes derives the session and delivery metadata: a synthetic `thread_id` on an ordinary reply is removed, while a genuine topic thread is preserved.
 - A feature-detected compression guard suppresses Hermes' late “compaction complete” success message only when that attempt's commit fence was cancelled. Normal completion remains visible.
-- Optional first-answer activation leaves preflight compression on ordinary status messages and creates the CardKit stream only when answer text exists. Fast final-only, stopped, and interrupted turns do not leave a loading-only card.
+- Hermes lifecycle notices are associated with their originating turn and absorbed by that turn's CardKit lifecycle. Preflight compression, provider retry, and late status callbacks no longer create text bubbles or a second status card beside the answer.
+- Optional first-answer activation still delays CardKit creation until answer text exists. It is useful when minimizing placeholder lifetime matters more than showing immediate feedback, but it does not provide the continuous one-card experience recommended by this fork.
 
 Upstream v1.7.0's relay support, schema-error recovery, Markdown escape cache and bounded panel history remain in place.
 
@@ -31,7 +32,9 @@ Upstream v1.7.0's relay support, schema-error recovery, Markdown escape cache an
 | Separate + full | Full streamed preview | Independent native message | Keep the typing experience |
 | Separate + compact | Short status and collapsible tools | Independent native message | Long answers and busy groups |
 
-The recommended pair is `final_delivery: card` plus `streaming_card_start: first_answer`. Preflight/compression stays outside the main card; the first answer content creates one CardKit message, reasoning/tools and body continue there, and the authoritative final replaces the same answer element before sealing. A provider that emits only a final still creates and seals that final in one card. The default `message_start` behavior remains compatible with existing Profiles.
+The recommended pair is `final_delivery: card` plus `streaming_card_start: message_start`. The CardKit message appears at turn start with one neutral preparation hint, then owns reasoning/tools, streamed answer text, the authoritative final, and completion. Automatic compression and provider lifecycle callbacks are associated with that turn instead of being published as extra messages. A provider that emits only a final still replaces the hint and seals that final in the same card.
+
+`streaming_card_start: first_answer` remains available when a deployment prefers no visible placeholder during long preflight work. It buffers reasoning/tools until answer text exists, so a short answer can appear almost complete rather than visibly stream. Lifecycle notices are still absorbed while the turn is owned by HLS.
 
 On the normal single-card path, the gateway reply is suppressed only after CardKit owns completion; create, final-write, or seal failure triggers the full text fallback instead of silently losing the answer. In separate mode, “Final answer follows” describes the next message and is **not** a delivery receipt.
 
