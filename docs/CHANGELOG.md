@@ -1,3 +1,8 @@
+## 1.7.0+moonawn.10 (unreleased fork candidate)
+
+- 修复 Phase 2 已成功创建正文元素并删除 loading hint 后，若新 token 恰在 CardKit API 往返期间到达，Phase 3 会复用上一批 actions、再次删除 `context_loading_hint` 的竞态。现在 Phase 2 ACK 后清空局部 action batch，Phase 3 只提交新变化，避免飞书 `300315 not find elementID` 使整批更新回滚并延迟正文。
+- 新增并发回归测试，模拟 answer stream 期间到达迟发 reasoning，验证第二批更新不含已确认的 Phase 2 操作。
+
 ## 1.7.0+moonawn.9 (unreleased fork candidate)
 
 - 修复真实长工具链触发 CardKit `300305 element exceeds the limit`：统一面板不再只按“20 轮/20 步”计数，而是按所有嵌套 `tag` 的真实 element 数限制在 180，并将 panel UTF-8 JSON 限制在 24 KB，为正文、loading 与 footer 预留容量。

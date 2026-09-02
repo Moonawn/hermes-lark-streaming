@@ -798,6 +798,54 @@ class TestDoUnifiedFlush:
         assert "panel" in session._creation_stages
 
     @pytest.mark.asyncio
+    async def test_phase2_actions_are_not_replayed_when_content_arrives_in_flight(self) -> None:
+        """A late delta must make Phase 3 send only fresh actions.
+
+        Phase 2 removes ``context_loading_hint``.  If a new reasoning delta
+        arrives during the following answer stream call, Phase 3 runs in the
+        same coroutine.  Reusing the Phase 2 action list would attempt to
+        delete the already-removed hint again and Feishu rejects the complete
+        atomic batch with 300315.
+        """
+        ctrl = _setup_ctrl()
+        session = _make_session("msg_phase2_replay", linear=True)
+        session.state = STREAMING
+        session.card_id = "card_phase2_replay"
+        session._creation_stages.discard("hint_removed")
+        session.existing_elements = {
+            _LOADING_HINT_ELEMENT_ID,
+            _LOADING_ELEMENT_ID,
+        }
+        session.unified_state.on_answer_delta("hello")
+        ctrl._sessions["msg_phase2_replay"] = session
+
+        batches: list[list[dict]] = []
+
+        async def capture_batch(card_id: str, actions: list[dict], **kw: object) -> None:
+            batches.append(list(actions))
+
+        async def stream_then_receive_reasoning(*args: object, **kwargs: object) -> None:
+            session.unified_state.on_reasoning_delta("late reasoning")
+
+        ctrl._client.cardkit_batch_update = AsyncMock(side_effect=capture_batch)
+        ctrl._client.cardkit_stream_element = AsyncMock(
+            side_effect=stream_then_receive_reasoning
+        )
+
+        await ctrl._do_unified_flush(session)
+
+        assert len(batches) == 2
+        assert any(action["action"] == "delete_elements" for action in batches[0])
+        assert all(
+            _LOADING_HINT_ELEMENT_ID
+            not in action.get("params", {}).get("element_ids", [])
+            for action in batches[1]
+        )
+        assert len(batches[1]) == 1
+        assert batches[1][0]["action"] == "add_elements"
+        assert batches[1][0]["params"]["target_element_id"] == ANSWER_ELEMENT_ID
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("code", [230020, 300309])
     async def test_api_errors_swallowed(self, code: int) -> None:
         """rate limited / streaming closed 不抛异常."""

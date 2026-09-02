@@ -530,6 +530,15 @@ class UnifiedControllerMixin:
             if not state.panel_dirty and not state.tool_steps_dirty and not state.answer_dirty:
                 return  # Phase 2 done, nothing more to do
 
+            # Phase 2 owns the actions accumulated above (create the answer /
+            # optional panel and remove the loading hint).  New deltas can
+            # arrive while those CardKit calls are in flight and make the
+            # state dirty again before this coroutine reaches Phase 3.  Never
+            # replay the already-ACKed Phase 2 batch in that case: the loading
+            # hint is gone, so replaying its delete makes the whole atomic
+            # Phase 3 batch fail with 300315 and delays the fresh content.
+            actions.clear()
+
         # ── Phase 3: Update existing panel + stream answer ──
         if _PANEL_OVERFLOW_SUPPRESSED in session._creation_stages:
             state.panel_dirty = False

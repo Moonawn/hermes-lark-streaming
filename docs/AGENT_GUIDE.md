@@ -2,7 +2,7 @@
 
 本文件描述本 fork。原作者的仓库、Gitee 同步和 PyPI 包不是本 fork 的发布渠道。
 
-当前开发候选为 `1.7.0+moonawn.9`。Python 需要 3.11 或更高；CardKit SDK 至少为 `lark-oapi>=1.4.24`。不要仅根据版本号大小就覆盖已有的私有修复。
+当前开发候选为 `1.7.0+moonawn.10`。Python 需要 3.11 或更高；CardKit SDK 至少为 `lark-oapi>=1.4.24`。不要仅根据版本号大小就覆盖已有的私有修复。
 
 ## 先在独立环境验证
 
