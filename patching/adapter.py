@@ -49,12 +49,35 @@ _COMPRESSION_LIFECYCLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_HOME_CHANNEL_ONBOARDING_RE = re.compile(
+    r"^\s*📬\s+No home channel is set for [^.\r\n]+\.\s+"
+    r"A home channel is where Hermes delivers cron job results and "
+    r"cross-platform messages\.\s+Type\s+/(?:hermes\s+)?sethome\s+"
+    r"to make this chat your home channel,\s+or ignore to skip\.\s*$",
+    re.IGNORECASE,
+)
+
 
 def _is_compression_lifecycle_message(content: str) -> bool:
     """Recognize automatic compression chatter, excluding manual feedback."""
     return bool(
         isinstance(content, str)
         and _COMPRESSION_LIFECYCLE_RE.search(content)
+    )
+
+
+def _is_home_channel_onboarding_notice(content: str) -> bool:
+    """Recognize Hermes's first-turn home-channel hint exactly.
+
+    Hermes emits this optional notice through the platform adapter before the
+    agent runs whenever a fresh session has no home channel.  With
+    ``message_start`` CardKit ownership that otherwise becomes a second card
+    beside the active answer card.  Keep the matcher narrow: slash-command
+    feedback and other gateway messages must remain visible.
+    """
+    return bool(
+        isinstance(content, str)
+        and _HOME_CHANNEL_ONBOARDING_RE.search(content)
     )
 
 
@@ -301,7 +324,8 @@ async def _dispatch_feishu_outbound(
         and metadata.get(_HLS_STATUS_DELIVERY_KEY)
     )
     _compression_status = _is_compression_lifecycle_message(_text_content)
-    if _marked_status or _compression_status:
+    _onboarding_notice = _is_home_channel_onboarding_notice(_text_content)
+    if _marked_status or _compression_status or _onboarding_notice:
         try:
             from ..controller import get_controller
 
@@ -317,9 +341,15 @@ async def _dispatch_feishu_outbound(
                     "msg=%s state=%s kind=%s",
                     str(getattr(_status_session, "message_id", "") or "?")[:12],
                     str(getattr(_status_session, "state", "unknown")),
-                    str(metadata.get(_HLS_STATUS_KEY) or "compression")
-                    if isinstance(metadata, dict)
-                    else "compression",
+                    (
+                        str(metadata.get(_HLS_STATUS_KEY) or "lifecycle")
+                        if isinstance(metadata, dict)
+                        else (
+                            "compression"
+                            if _compression_status
+                            else "home_channel_onboarding"
+                        )
+                    ),
                 )
                 return _send_result_ok()
         except Exception:

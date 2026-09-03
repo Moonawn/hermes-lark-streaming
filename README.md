@@ -4,7 +4,7 @@
 
 An independently maintained fork of [Aowen-Nowor/hermes-lark-streaming](https://github.com/Aowen-Nowor/hermes-lark-streaming), based on upstream **v1.7.0** (`aef71a8`). The upstream project in turn credits [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming). Original attribution and the MIT license are retained.
 
-**Development candidate: `1.7.0+moonawn.10`. No stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a continuous single-card reading experience. It is a Hermes plugin, not a Codex plugin.
+**Development candidate: `1.7.0+moonawn.12`. No stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a continuous single-card reading experience. It is a Hermes plugin, not a Codex plugin.
 
 ## What changes
 

@@ -17,6 +17,7 @@ from hermes_lark_streaming.patching import (
 from hermes_lark_streaming.patching.adapter import (
     _dispatch_feishu_outbound,
     _is_compression_lifecycle_message,
+    _is_home_channel_onboarding_notice,
 )
 from hermes_lark_streaming.patching.gateway import _wrap_send_or_update_status
 
@@ -186,6 +187,78 @@ def test_legacy_compression_classifier_rejects_answer_and_manual_feedback(
     content: str,
 ) -> None:
     assert not _is_compression_lifecycle_message(content)
+
+
+_HOME_CHANNEL_NOTICE = (
+    "📬 No home channel is set for Feishu. A home channel is where Hermes "
+    "delivers cron job results and cross-platform messages.\n\n"
+    "Type /sethome to make this chat your home channel, or ignore to skip."
+)
+
+
+def test_home_channel_onboarding_classifier_accepts_exact_notice() -> None:
+    assert _is_home_channel_onboarding_notice(_HOME_CHANNEL_NOTICE)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "No home channel is set; here is how to configure it.",
+        "📬 No home channel is set for Feishu.",
+        "/sethome completed",
+        "下面解释为什么 Hermes 提示 No home channel is set。",
+    ],
+)
+def test_home_channel_onboarding_classifier_rejects_other_messages(
+    content: str,
+) -> None:
+    assert not _is_home_channel_onboarding_notice(content)
+
+
+@pytest.mark.asyncio
+async def test_home_channel_notice_is_absorbed_by_active_single_card_turn() -> None:
+    session = _session()
+    ctrl = SimpleNamespace(
+        enabled=True,
+        _sess_get=lambda _message_id: None,
+        _sess_values_snapshot=lambda: [session],
+        _do_gateway_deliver=AsyncMock(),
+    )
+    native = AsyncMock()
+
+    with (
+        patch("hermes_lark_streaming.controller.get_controller", return_value=ctrl),
+        patch("hermes_lark_streaming.patching.adapter._get_config", return_value=_config()),
+    ):
+        result = await _dispatch_feishu_outbound(
+            object(), "oc_chat", _HOME_CHANNEL_NOTICE, native,
+        )
+
+    native.assert_not_awaited()
+    ctrl._do_gateway_deliver.assert_not_awaited()
+    assert getattr(result, "success", True)
+
+
+@pytest.mark.asyncio
+async def test_home_channel_notice_without_active_turn_remains_visible() -> None:
+    ctrl = SimpleNamespace(
+        enabled=True,
+        _sess_get=lambda _message_id: None,
+        _sess_values_snapshot=lambda: [],
+        _do_gateway_deliver=AsyncMock(return_value=("message", "card")),
+    )
+    native = AsyncMock()
+
+    with (
+        patch("hermes_lark_streaming.controller.get_controller", return_value=ctrl),
+        patch("hermes_lark_streaming.patching.adapter._get_config", return_value=_config()),
+    ):
+        await _dispatch_feishu_outbound(
+            object(), "oc_chat", _HOME_CHANNEL_NOTICE, native,
+        )
+
+    ctrl._do_gateway_deliver.assert_awaited_once()
+    native.assert_not_awaited()
 
 
 @pytest.mark.asyncio

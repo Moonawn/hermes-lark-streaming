@@ -1,3 +1,8 @@
+## 1.7.0+moonawn.12 (unreleased fork candidate)
+
+- 修复新 session 首轮没有配置 Feishu home channel 时，Hermes 的可忽略 onboarding 提示绕过 turn ContextVar 并生成第二张 gateway 卡的问题。HLS 现在只对完整固定句式做严格识别，且仅在同一聊天存在唯一活动单卡 turn 时吸收；没有活动 turn、`/sethome` 回执及其他 gateway 消息仍保持可见。
+- 普通 Feishu gateway 中误暴露的评论上下文专用 `feishu_doc` / `feishu_drive` 工具属于 Hermes core 配置边界，本候选配合在部署 Profile 的 `agent.disabled_toolsets` 中禁用；文档评论 Agent 显式启用的原工具不受影响。
+
 ## 1.7.0+moonawn.11 (unreleased fork candidate)
 
 - 修复 Hermes 0.21 在 preflight context compression 阶段抛错时，message-start 流式卡已发布但 `_run_agent` completion hook 尚未执行，插件只因“卡片存在”便吞掉 gateway 安全错误文本，导致卡片永久保持加载态。现在会把 gateway 的终态结果写回同一张卡：错误进入 error panel、普通终稿进入 answer，并沿用原有封卡与 ACK 后抑制逻辑。

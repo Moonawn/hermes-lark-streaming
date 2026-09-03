@@ -4,7 +4,7 @@
 
 这是 [Aowen-Nowor/hermes-lark-streaming](https://github.com/Aowen-Nowor/hermes-lark-streaming) 的独立 fork，基于上游 **v1.7.0 / `aef71a8`**。上游亦基于 [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming) 发展而来，原有署名与 MIT 许可证保留。此项目是 Hermes 插件，不是 Codex 插件。
 
-**当前是开发候选 `1.7.0+moonawn.10`，尚未发布稳定版。** 维护重点是终稿完整送达、流式任务可靠收尾，以及连续、易读的单卡体验。
+**当前是开发候选 `1.7.0+moonawn.12`，尚未发布稳定版。** 维护重点是终稿完整送达、流式任务可靠收尾，以及连续、易读的单卡体验。
 
 ## 已加入的修正
 
