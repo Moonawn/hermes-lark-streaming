@@ -18,6 +18,7 @@ from hermes_lark_streaming.feishu.client import FeishuClient
 from hermes_lark_streaming.patching import _msg_ctx
 from hermes_lark_streaming.patching.adapter import _dispatch_feishu_outbound
 from hermes_lark_streaming.patching.gateway import (
+    _gateway_terminal_payload,
     _wrap_handle_message_with_agent,
     _wrap_run_agent,
 )
@@ -47,6 +48,59 @@ def setup(*, separate=False, message_id="om_turn"):
     )
     ctrl._schedule_linear_flush = Mock()
     return ctrl, session
+
+
+def test_gateway_terminal_payload_classifies_safe_gateway_error():
+    error = (
+        "Sorry, I encountered an unexpected error.\n"
+        "Try again or use /reset to start a fresh session."
+    )
+    assert _gateway_terminal_payload(error) == ("", error)
+    assert _gateway_terminal_payload("完整最终答复") == ("完整最终答复", "")
+
+
+@pytest.mark.asyncio
+async def test_preflight_gateway_error_seals_existing_streaming_card(monkeypatch):
+    """A pre-_run_agent failure must terminate the one existing card."""
+    ctrl, session = setup()
+    monkeypatch.setitem(
+        ctrl._cfg._raw,
+        "feishu",
+        {"app_id": "test", "app_secret": "test"},
+    )
+    ctrl._complete_session = Mock()
+
+    import hermes_lark_streaming.controller as controller_module
+    from hermes_lark_streaming.patching import hooks
+
+    monkeypatch.setattr(controller_module, "get_controller", lambda: ctrl)
+    monkeypatch.setattr(hooks, "get_controller", lambda: ctrl)
+    monkeypatch.setattr(hooks, "on_message_started", lambda **_: None)
+
+    runner = SimpleNamespace(_reply_anchor_for_event=lambda event: event.message_id)
+    source = SimpleNamespace(
+        platform=SimpleNamespace(value="feishu"),
+        chat_id=session.chat_id,
+    )
+    event = SimpleNamespace(message_id=session.message_id)
+    safe_error = (
+        "Sorry, I encountered an unexpected error.\n"
+        "Try again or use /reset to start a fresh session."
+    )
+
+    async def fail_before_run_agent(*_args, **_kwargs):
+        _msg_ctx.get()["event_message_id"] = session.message_id
+        return safe_error
+
+    result = await _wrap_handle_message_with_agent(fail_before_run_agent)(
+        runner, event, source,
+    )
+
+    assert result is None
+    assert session.state == CardPhase.COMPLETING
+    assert session.error_message == safe_error
+    ctrl._complete_session.assert_called_once_with(session)
+    assert _msg_ctx.get() is None
 
 
 @pytest.mark.asyncio

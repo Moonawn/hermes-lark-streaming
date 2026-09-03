@@ -104,6 +104,40 @@ def _is_serialized_feishu_chat(source: Any) -> bool:
         return False
 
 
+def _gateway_terminal_payload(result: Any) -> tuple[str, str]:
+    """Extract a terminal answer/error returned outside ``_run_agent``.
+
+    Hermes can fail during preflight context compression before the wrapped
+    ``_run_agent`` completion hook runs. In that case
+    ``_handle_message_with_agent`` returns a user-safe plain-text error while
+    the already-published CardKit session is still STREAMING. Keep that
+    terminal payload in the same card instead of suppressing it and leaving
+    the card open forever.
+    """
+    if isinstance(result, str):
+        text = result.strip()
+        if not text:
+            return "", ""
+        lowered = text.lower()
+        is_error = lowered.startswith(
+            (
+                "sorry, i encountered an unexpected error",
+                "agent error",
+                "error:",
+            )
+        ) or text.startswith(("⚠", "❌"))
+        return ("", text) if is_error else (text, "")
+    if isinstance(result, dict):
+        error = str(
+            result.get("error")
+            or result.get("interrupt_message")
+            or ""
+        ).strip()
+        answer = str(result.get("final_response") or "").strip()
+        return answer, error
+    return "", ""
+
+
 def _chat_serial_lock(chat_id: str) -> tuple[tuple[int, str], asyncio.Lock]:
     loop = asyncio.get_running_loop()
     key = (id(loop), chat_id)
@@ -382,6 +416,51 @@ def _wrap_handle_message_with_agent(orig: Callable) -> Callable:
         if ctx.get("final_yielded"):
             _hls_cleanup_ctx()
             return result
+
+        # Hermes 0.21 can fail closed during preflight compression before
+        # _wrap_run_agent reaches its normal COMPLETE hook. The gateway then
+        # returns a safe text error here while the message-start card is still
+        # STREAMING. Previously the session-existence fallback below merely
+        # suppressed that text, leaving the card spinning indefinitely.
+        # Promote the gateway result into the existing card's terminal state;
+        # serialized chats will wait for the delivery ACK below before the
+        # native reply is suppressed.
+        if result is not None and not _get_config().independent_final_delivery:
+            try:
+                from ..controller import get_controller
+                from .hooks import on_message_completed
+
+                _ctrl = get_controller()
+                _eid = ctx.get("event_message_id") or mid
+                _sess = _ctrl._sess_get(_eid) if _ctrl and _ctrl.enabled else None
+                if (
+                    _sess
+                    and _sess.card_msg_id
+                    and _sess.state not in TERMINAL_PHASES
+                    and _sess.state != "completing"
+                ):
+                    _answer, _error = _gateway_terminal_payload(result)
+                    if _answer or _error:
+                        _owned = on_message_completed(
+                            message_id=_eid,
+                            answer=_answer,
+                            duration=time.monotonic()
+                            - ctx.get("_msg_start_time", time.monotonic()),
+                            error_message=_error,
+                        )
+                        if _owned:
+                            ctx["card_sent"] = True
+                            _logger.info(
+                                "HLS: terminal gateway result promoted into active "
+                                "card msg=%s kind=%s",
+                                (_eid or "?")[:12],
+                                "error" if _error else "answer",
+                            )
+            except Exception:
+                _logger.warning(
+                    "HLS: failed to promote terminal gateway result into card",
+                    exc_info=True,
+                )
         serialized_chat = _is_serialized_feishu_chat(source)
         if serialized_chat and ctx.get("card_sent") and not _get_config().independent_final_delivery:
             try:

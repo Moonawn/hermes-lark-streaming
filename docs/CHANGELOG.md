@@ -1,3 +1,8 @@
+## 1.7.0+moonawn.11 (unreleased fork candidate)
+
+- 修复 Hermes 0.21 在 preflight context compression 阶段抛错时，message-start 流式卡已发布但 `_run_agent` completion hook 尚未执行，插件只因“卡片存在”便吞掉 gateway 安全错误文本，导致卡片永久保持加载态。现在会把 gateway 的终态结果写回同一张卡：错误进入 error panel、普通终稿进入 answer，并沿用原有封卡与 ACK 后抑制逻辑。
+- 补充压缩前置失败回归测试；修正 mock E2E 对 `message_start`、单卡交付及 completion timeout 的显式配置，避免 `MagicMock` 将新增布尔配置误判为启用。全套测试覆盖实际单卡形态。
+
 ## 1.7.0+moonawn.10 (unreleased fork candidate)
 
 - 修复 Phase 2 已成功创建正文元素并删除 loading hint 后，若新 token 恰在 CardKit API 往返期间到达，Phase 3 会复用上一批 actions、再次删除 `context_loading_hint` 的竞态。现在 Phase 2 ACK 后清空局部 action batch，Phase 3 只提交新变化，避免飞书 `300315 not find elementID` 使整批更新回滚并延迟正文。
