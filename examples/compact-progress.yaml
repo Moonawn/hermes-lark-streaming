@@ -1,0 +1,25 @@
+# ALTERNATIVE split presentation. The recommended continuous mode is
+# examples/single-card-streaming.yaml.
+# Merge into a TEST Profile's config.yaml; never replace its whole config.
+# Credentials and real chat IDs belong only in the private Profile.
+hermes_lark_streaming:
+  enabled: true
+  final_delivery: separate_message
+  progress_card: compact       # full keeps streamed body previews
+  streaming_card_start: first_answer  # preflight/compression stays non-streaming
+  verified_delivery: false     # keep the native Hermes delivery owner
+  card_completion_timeout_sec: 10
+  answer_flush_interval_ms: 800
+  flush_interval_ms: 1000
+  print_strategy: fast
+  streaming_panel_expanded: false
+  panel_expanded: false
+  max_tool_steps: 8
+  max_reasoning_rounds: 3
+  queue:
+    serialized_chat_ids: []    # opt in privately; no global serialization
+    verify_waiting_message_available: true
+display:
+  platforms:
+    feishu:
+      show_reasoning: false

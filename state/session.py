@@ -24,6 +24,7 @@ from ..flush import FlushController
 from .linear import UnifiedLinearState
 from .text import TextState
 from .tooluse import ToolUseTracker
+from .writer import CardWriter
 from ..feishu import UnavailableGuard
 
 if TYPE_CHECKING:
@@ -36,9 +37,13 @@ class CardSession:
 
     __slots__ = (
         "_card_ready",
+        "_card_activation_lock",
+        "_card_activation_requested",
         "_continuation_reactivation_count",
         "_create_epoch_snap",
         "_creation_stages",
+        "_delivery_done",
+        "_delivery_success",
         "_first_answer_time",
         "_first_flush_done",
         "_is_continuation",
@@ -58,10 +63,16 @@ class CardSession:
         "deferred_background_review_closed",
         "deferred_background_review_lock",
         "deferred_background_reviews",
+        "defer_card_until_answer",
         "error_message",
         "existing_elements",
         "flush",
         "footer",
+        "final_answer",
+        "fallback_message_ids",
+        "completion_started_at",
+        "completion_task",
+        "writer",
         "guard",
         "linear",
         "message_id",
@@ -93,6 +104,12 @@ class CardSession:
         self.tool_use = ToolUseTracker()
         self.flush = FlushController()
         self.footer: dict[str, Any] = {}
+        # Immutable once completion is accepted; never derived from progress.
+        self.final_answer: str = ""
+        self.fallback_message_ids: dict[str, str] = {}
+        self.completion_started_at: float = 0.0
+        self.completion_task = None
+        self.writer = CardWriter()
         self.sequence = 1
         self._loop = loop
         self.created_at = time.time()
@@ -125,9 +142,27 @@ class CardSession:
         self._streaming_closed: bool = False
         # v1.2.0 L1: "streaming closed" 日志去重——同一张卡第一次打 INFO，之后降 DEBUG
         self._streaming_closed_logged: bool = False
+        # Card creation can be requested by callbacks arriving from different
+        # threads. Claim it before scheduling so a fast completion cannot
+        # overtake an IDLE create task.
+        self._card_activation_lock = Lock()
+        self._card_activation_requested: bool = False
         self._card_ready: asyncio.Event = asyncio.Event()
+        self._delivery_done: asyncio.Event = asyncio.Event()
+        self._delivery_success: bool = False
         self._is_continuation: bool = False
         self._continuation_reactivation_count: int = 0
+        # Snapshotted at message start so a config reload cannot strand a turn
+        # halfway through its lifecycle.
+        self.defer_card_until_answer: bool = False
+
+    def mark_delivery_done(self, success: bool) -> None:
+        """Legacy queue receipt: card/fallback ACK, not verified body delivery.
+
+        Verified final messages have an independent durable DeliveryLedger.
+        """
+        self._delivery_success = bool(success)
+        self._delivery_done.set()
 
     def transition(self, to: str, source: str = "", reason: str = "") -> bool:
         """rejected.  Illegal transitions are logged but do not raise."""
@@ -197,3 +232,6 @@ class CardSession:
         )
         # Signal readiness so awaiters don't deadlock
         self._card_ready.set()
+        self.flush.abort_pending()
+        self.writer.close()
+        self.mark_delivery_done(False)

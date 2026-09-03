@@ -48,6 +48,9 @@ class _DummyFlush:
     def mark_completed(self) -> None:
         self.completed = True
 
+    def abort_pending(self) -> None:
+        self.completed = True
+
 
 @pytest.mark.parametrize("message_id", [None, ""])
 def test_on_message_started_ignores_missing_message_id(message_id: str | None) -> None:
@@ -76,11 +79,89 @@ def test_on_message_started_registers_anchor_alias_and_cleanup() -> None:
     assert "quoted" not in ctrl._sessions
 
 
+def test_cleanup_preserves_route_to_active_continuation() -> None:
+    ctrl = _setup_ctrl(linear=True)
+    old_session = _make_session("old", linear=True)
+    old_session.state = COMPLETED
+    continuation = _make_session("continuation", linear=True)
+    continuation.state = STREAMING
+    ctrl._sessions["old"] = old_session
+    ctrl._sessions["continuation"] = continuation
+    ctrl._register_continuation("old", "continuation")
+
+    ctrl._cleanup("old")
+
+    assert "old" not in ctrl._sessions
+    assert ctrl._resolve_continuation_id("old") == "continuation"
+
+
+def test_cleanup_then_on_completed_closes_continuation_and_rejects_late_output() -> None:
+    ctrl = _setup_ctrl(linear=True)
+    old_session = _make_session("old", linear=True)
+    old_session.state = COMPLETED
+    continuation = _make_session("continuation", linear=True)
+    continuation.state = STREAMING
+    continuation.unified_state.on_answer_delta("partial")
+    ctrl._sessions["old"] = old_session
+    ctrl._sessions["continuation"] = continuation
+    ctrl._register_continuation("old", "continuation")
+
+    ctrl._cleanup("old")
+    with patch.object(ctrl, "_complete_session") as complete_session:
+        assert ctrl.on_completed(message_id="old", answer="partial final")
+
+    assert continuation.state == COMPLETING
+    assert continuation.unified_state.answer_text == "partial final"
+    assert ctrl._resolve_continuation_id("old") is None
+    complete_session.assert_called_once_with(continuation)
+
+    ctrl.on_answer(message_id="old", text=" late review")
+    sent: list[str] = []
+    assert not ctrl.defer_background_review(
+        message_id="old", text="background review", sender=sent.append
+    )
+    assert continuation.unified_state.answer_text == "partial final"
+    assert sent == []
+
+
+def test_reply_anchor_continuation_is_completed_via_inbound_message_id() -> None:
+    """Callbacks may stream with anchor_id while completion uses inbound ID."""
+    ctrl = _setup_ctrl(linear=True)
+    old_session = _make_session("inbound", linear=True)
+    old_session.anchor_id = "quoted"
+    old_session.state = COMPLETED
+    continuation = _make_session("quoted-cont-1", linear=True)
+    continuation.state = STREAMING
+    continuation.unified_state.on_answer_delta("partial")
+    ctrl._sessions["inbound"] = old_session
+    ctrl._sessions["quoted"] = old_session
+    ctrl._sessions["quoted-cont-1"] = continuation
+
+    # The first post-tool token is keyed by the quoted/anchor ID.
+    ctrl._register_continuation("quoted", "quoted-cont-1")
+    assert ctrl._resolve_continuation_id("quoted") == "quoted-cont-1"
+    assert ctrl._resolve_continuation_id("inbound") == "quoted-cont-1"
+
+    # Hermes completes the turn with the inbound message ID.
+    with patch.object(ctrl, "_complete_session") as complete_session:
+        assert ctrl.on_completed(message_id="inbound", answer="partial final")
+
+    assert continuation.state == COMPLETING
+    assert continuation.unified_state.answer_text == "partial final"
+    assert ctrl._resolve_continuation_id("quoted") is None
+    assert ctrl._resolve_continuation_id("inbound") is None
+    complete_session.assert_called_once_with(continuation)
+
+
 def test_on_interrupted_uses_new_message_id_and_anchor_alias() -> None:
     ctrl = StreamCardController()
     _enable(ctrl)
 
-    with patch.object(ctrl, "_fire_and_forget", side_effect=lambda coro, loop: coro.close()):
+    with patch.object(
+        ctrl,
+        "_fire_and_forget",
+        side_effect=lambda coro, loop: (coro.close(), MagicMock())[1],
+    ):
         ctrl.on_message_started(message_id="old", chat_id="chat")
         ctrl.on_interrupted(
             old_message_id="old",
@@ -207,6 +288,8 @@ def test_prune_stale_sessions_ignores_none_key_and_prunes_valid_key() -> None:
         created_at=time.time() - ctrl._session_ttl - 1,
         flush=_DummyFlush(),
         is_terminal_phase=True,
+        state=COMPLETED,
+        writer=MagicMock(),
     )
     ctrl._sessions[None] = stale_session  # type: ignore[index,assignment]
     ctrl._sessions["msg"] = valid_stale_session  # type: ignore[assignment]
@@ -715,6 +798,54 @@ class TestDoUnifiedFlush:
         assert "panel" in session._creation_stages
 
     @pytest.mark.asyncio
+    async def test_phase2_actions_are_not_replayed_when_content_arrives_in_flight(self) -> None:
+        """A late delta must make Phase 3 send only fresh actions.
+
+        Phase 2 removes ``context_loading_hint``.  If a new reasoning delta
+        arrives during the following answer stream call, Phase 3 runs in the
+        same coroutine.  Reusing the Phase 2 action list would attempt to
+        delete the already-removed hint again and Feishu rejects the complete
+        atomic batch with 300315.
+        """
+        ctrl = _setup_ctrl()
+        session = _make_session("msg_phase2_replay", linear=True)
+        session.state = STREAMING
+        session.card_id = "card_phase2_replay"
+        session._creation_stages.discard("hint_removed")
+        session.existing_elements = {
+            _LOADING_HINT_ELEMENT_ID,
+            _LOADING_ELEMENT_ID,
+        }
+        session.unified_state.on_answer_delta("hello")
+        ctrl._sessions["msg_phase2_replay"] = session
+
+        batches: list[list[dict]] = []
+
+        async def capture_batch(card_id: str, actions: list[dict], **kw: object) -> None:
+            batches.append(list(actions))
+
+        async def stream_then_receive_reasoning(*args: object, **kwargs: object) -> None:
+            session.unified_state.on_reasoning_delta("late reasoning")
+
+        ctrl._client.cardkit_batch_update = AsyncMock(side_effect=capture_batch)
+        ctrl._client.cardkit_stream_element = AsyncMock(
+            side_effect=stream_then_receive_reasoning
+        )
+
+        await ctrl._do_unified_flush(session)
+
+        assert len(batches) == 2
+        assert any(action["action"] == "delete_elements" for action in batches[0])
+        assert all(
+            _LOADING_HINT_ELEMENT_ID
+            not in action.get("params", {}).get("element_ids", [])
+            for action in batches[1]
+        )
+        assert len(batches[1]) == 1
+        assert batches[1][0]["action"] == "add_elements"
+        assert batches[1][0]["params"]["target_element_id"] == ANSWER_ELEMENT_ID
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("code", [230020, 300309])
     async def test_api_errors_swallowed(self, code: int) -> None:
         """rate limited / streaming closed 不抛异常."""
@@ -741,6 +872,104 @@ class TestDoUnifiedFlush:
 
         # Should not raise
         await ctrl._do_unified_flush(session)
+
+
+class TestElementLimitRecovery:
+    """300305 is permanent: preserve the answer and never retry-storm."""
+
+    @pytest.mark.asyncio
+    async def test_phase2_retries_once_without_panel(self) -> None:
+        ctrl = _setup_ctrl(linear=True)
+        session = _make_session("msg_limit_phase2", linear=True)
+        session.state = STREAMING
+        session.card_id = "card_limit_phase2"
+        session.existing_elements = {_LOADING_HINT_ELEMENT_ID, _LOADING_ELEMENT_ID}
+        session.unified_state.on_reasoning_delta("thinking")
+        session.unified_state.on_answer_delta("answer survives")
+        ctrl._sessions[session.message_id] = session
+
+        error = FeishuAPIError("element exceeds the limit", code=300305)
+        ctrl._client.cardkit_batch_update = AsyncMock(side_effect=[error, None])
+
+        await ctrl._do_unified_flush(session)
+
+        assert ctrl._client.cardkit_batch_update.await_count == 2
+        recovery_actions = ctrl._client.cardkit_batch_update.await_args_list[1].args[1]
+        added = [
+            element
+            for action in recovery_actions
+            if action.get("action") == "add_elements"
+            for element in action.get("params", {}).get("elements", [])
+        ]
+        assert [element.get("element_id") for element in added] == [ANSWER_ELEMENT_ID]
+        assert "answer" in session._creation_stages
+        assert "panel" not in session._creation_stages
+        assert "panel_overflow_suppressed" in session._creation_stages
+        ctrl._client.cardkit_stream_element.assert_awaited_once()
+        assert session.unified_state.answer_dirty is False
+
+    @pytest.mark.asyncio
+    async def test_phase3_suppresses_future_panel_retries_but_streams_answer(self) -> None:
+        ctrl = _setup_ctrl(linear=True)
+        session = _make_session("msg_limit_phase3", linear=True)
+        session.state = STREAMING
+        session.card_id = "card_limit_phase3"
+        session._creation_stages = {"answer", "panel", "hint_removed"}
+        session.existing_elements = {ANSWER_ELEMENT_ID, UNIFIED_PANEL_ELEMENT_ID}
+        session.unified_state.on_reasoning_delta("thinking")
+        session.unified_state.on_answer_delta("answer survives")
+        ctrl._sessions[session.message_id] = session
+
+        error = FeishuAPIError("element exceeds the limit", code=300305)
+        ctrl._client.cardkit_batch_update = AsyncMock(side_effect=error)
+
+        await ctrl._do_unified_flush(session)
+
+        assert ctrl._client.cardkit_batch_update.await_count == 1
+        assert "panel_overflow_suppressed" in session._creation_stages
+        assert session.unified_state.panel_dirty is False
+        assert session.unified_state.tool_steps_dirty is False
+        ctrl._client.cardkit_stream_element.assert_awaited_once()
+        assert session.unified_state.answer_dirty is False
+
+        session.unified_state.on_tool_event()
+        await ctrl._do_unified_flush(session)
+        assert ctrl._client.cardkit_batch_update.await_count == 1
+        assert session.unified_state.panel_dirty is False
+
+    @pytest.mark.asyncio
+    async def test_final_seal_retries_once_without_panel_or_footer(self) -> None:
+        ctrl = _setup_ctrl(linear=True)
+        session = _make_session("msg_limit_seal", linear=True)
+        session.state = STREAMING
+        session.card_id = "card_limit_seal"
+        session._creation_stages = {"answer", "panel", "hint_removed"}
+        session.existing_elements = {
+            ANSWER_ELEMENT_ID,
+            UNIFIED_PANEL_ELEMENT_ID,
+            _LOADING_ELEMENT_ID,
+        }
+        session.unified_state.on_answer_delta("authoritative final")
+        session.unified_state.answer_dirty = False
+        session.unified_state.panel_dirty = False
+        session.unified_state.tool_steps_dirty = False
+
+        error = FeishuAPIError("element exceeds the limit", code=300305)
+        ctrl._client.cardkit_batch_update = AsyncMock(side_effect=[error, None])
+
+        assert await ctrl._preservative_seal(session)
+
+        assert ctrl._client.cardkit_batch_update.await_count == 2
+        compact_actions = ctrl._client.cardkit_batch_update.await_args_list[1].args[1]
+        updated_ids = {
+            action.get("params", {}).get("element_id")
+            for action in compact_actions
+            if action.get("action") == "partial_update_element"
+        }
+        assert updated_ids == {ANSWER_ELEMENT_ID}
+        assert "panel_overflow_suppressed" in session._creation_stages
+        ctrl._client.cardkit_close_streaming.assert_awaited_once()
+        assert session._streaming_closed is True
 
 
 # ── Split/rollover tests — REMOVED in unified panel architecture ──
@@ -1445,6 +1674,7 @@ def test_prune_skips_streaming_session() -> None:
         created_at=time.time() - ctrl._session_ttl - 1,
         flush=_DummyFlush(),
         is_terminal_phase=False,  # STREAMING 不是终态
+        state=STREAMING,
     )
     ctrl._sessions["active"] = active_session  # type: ignore[assignment]
 
@@ -1464,6 +1694,8 @@ def test_prune_cleans_terminal_session() -> None:
         created_at=time.time() - ctrl._session_ttl - 1,
         flush=_DummyFlush(),
         is_terminal_phase=True,  # COMPLETED 是终态
+        state=COMPLETED,
+        writer=MagicMock(),
     )
     ctrl._sessions["done"] = terminal_session  # type: ignore[assignment]
 
@@ -1584,7 +1816,11 @@ def test_v134_concurrency_seal_no_duplicate_session() -> None:
     _enable(ctrl, linear=True)
 
     # 模拟 concurrency seal：先创建一个 active session（旧消息）
-    with patch.object(ctrl, "_fire_and_forget", side_effect=lambda coro, loop: coro.close()):
+    with patch.object(
+        ctrl,
+        "_fire_and_forget",
+        side_effect=lambda coro, loop: (coro.close(), MagicMock())[1],
+    ):
         ctrl.on_message_started(message_id="old_msg", chat_id="chat")
         assert "old_msg" in ctrl._sessions
 

@@ -11,6 +11,7 @@ license = {text = "MIT"}
 requires-python = ">=3.11"
 authors = [
     {name = "Aowen-Nowor"},
+    {name = "Moonawn"},
 ]
 dependencies = [
     "lark-oapi>=1.4.24",  # v1.7.0: 1.4.0 has NO async cardkit API (acreate/aupdate/abatch_update/asettings) — plugin cannot run; 1.4.24+ verified to ship the full async set incl. card_element.acontent
@@ -43,8 +44,8 @@ testpaths = ["tests"]
 # NOTE: no pythonpath needed — conftest.py registers the repo root
 # as the hermes_lark_streaming package via importlib.
 asyncio_mode = "auto"
-# Integration tests require HERMES_SRC_DIR (set by hermes-integration-test.yml).
-# Exclude from default `pytest tests/` run to avoid 25 skipped in sync-from-gitee.
+# Integration tests require HERMES_SRC_DIR (set by ci.yml).
+# Exclude from default runs; ci.yml executes them against pinned Hermes commits.
 # Run explicitly: `pytest tests/integration/`
 norecursedirs = ["tests/integration"]
 filterwarnings = [

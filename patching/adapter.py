@@ -3,23 +3,252 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import re
 import threading
 import time
-from typing import Any, Callable
+from collections import OrderedDict
+from collections.abc import Callable
+from typing import Any
 
 from .. import __version__
 from . import (
-    _msg_ctx,
+    _HLS_STATUS_DELIVERY_KEY,
+    _HLS_STATUS_KEY,
+    _HLS_STATUS_TURN_KEY,
     _gateway_cards,
     _gateway_cards_lock,
-    _logger,
     _get_config,
+    _logger,
+    _msg_ctx,
     _patched_feishu_classes,
     _send_result_ok,
 )
 
 # ── FeishuAdapter interception layer (Phase 1: gateway message cards) ─
+
+_CARD_REPLY_CONTEXT_MAX = 500
+_CARD_REPLY_CONTEXT_CHARS = 2000
+_card_reply_contexts: OrderedDict[str, str] = OrderedDict()
+_card_reply_contexts_lock = threading.Lock()
+
+_COMPRESSION_LIFECYCLE_RE = re.compile(
+    r"^\s*(?:"
+    r"📦\s+(?:preflight|pre-api|pre api)\s+compression\s*:"
+    r"|🗜️?\s+(?:compacting\s+context\b|context\s+too\s+large\b|"
+      r"compressed\s+~?[\d,]+\s+(?:→|->)\s+~?[\d,]+\s+"
+      r"(?:messages|tokens),\s+retrying\b|context\s+reduced\s+to\b)"
+    r"|💤\s+resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting\b"
+    r"|⟳\s+compacting\s+context\b"
+    r"|✓\s+context\s+compaction\s+complete\b"
+    r"|⚠️?\s+context\s+compression\s+timed\s+out\b"
+    r"|⚠️?\s+context\s+is\s+over\s+the\s+compression\s+threshold\b"
+    r"|⚠️?\s+session\s+compressed\s+\d+\s+times\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_HOME_CHANNEL_ONBOARDING_RE = re.compile(
+    r"^\s*📬\s+No home channel is set for [^.\r\n]+\.\s+"
+    r"A home channel is where Hermes delivers cron job results and "
+    r"cross-platform messages\.\s+Type\s+/(?:hermes\s+)?sethome\s+"
+    r"to make this chat your home channel,\s+or ignore to skip\.\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_compression_lifecycle_message(content: str) -> bool:
+    """Recognize automatic compression chatter, excluding manual feedback."""
+    return bool(
+        isinstance(content, str)
+        and _COMPRESSION_LIFECYCLE_RE.search(content)
+    )
+
+
+def _is_home_channel_onboarding_notice(content: str) -> bool:
+    """Recognize Hermes's first-turn home-channel hint exactly.
+
+    Hermes emits this optional notice through the platform adapter before the
+    agent runs whenever a fresh session has no home channel.  With
+    ``message_start`` CardKit ownership that otherwise becomes a second card
+    beside the active answer card.  Keep the matcher narrow: slash-command
+    feedback and other gateway messages must remain visible.
+    """
+    return bool(
+        isinstance(content, str)
+        and _HOME_CHANNEL_ONBOARDING_RE.search(content)
+    )
+
+
+def _status_session_for_turn(ctrl: Any, chat_id: str, metadata: Any) -> Any:
+    """Resolve an HLS session for a tagged lifecycle/status delivery.
+
+    Prefer the captured inbound message id.  If an older Hermes build loses
+    that context, use an unambiguous active session in the same chat.  Terminal
+    sessions are accepted only by exact id so a late callback from the just
+    finished turn is swallowed without hiding a later manual ``/compress``.
+    """
+    candidate_ids: list[str] = []
+    if isinstance(metadata, dict):
+        for key in (_HLS_STATUS_TURN_KEY, "reply_to_message_id"):
+            value = str(metadata.get(key) or "")
+            if value and value not in candidate_ids:
+                candidate_ids.append(value)
+    ctx = _msg_ctx.get(None)
+    if isinstance(ctx, dict):
+        value = str(ctx.get("event_message_id") or ctx.get("message_id") or "")
+        if value and value not in candidate_ids:
+            candidate_ids.append(value)
+
+    for message_id in candidate_ids:
+        try:
+            session = ctrl._sess_get(message_id)
+        except Exception:
+            session = None
+        if session is not None and str(getattr(session, "chat_id", "")) == chat_id:
+            return session
+
+    try:
+        sessions = ctrl._sess_values_snapshot()
+    except Exception:
+        sessions = []
+    unique: list[Any] = []
+    seen: set[int] = set()
+    for session in sessions or []:
+        if id(session) in seen:
+            continue
+        seen.add(id(session))
+        if str(getattr(session, "chat_id", "")) != chat_id:
+            continue
+        try:
+            terminal = bool(session.is_terminal_phase)
+        except Exception:
+            terminal = False
+        if not terminal:
+            unique.append(session)
+    return unique[0] if len(unique) == 1 else None
+
+
+def _normalize_card_reply_context(answer: str) -> str:
+    """Return a compact, bounded parent-message excerpt."""
+    if not isinstance(answer, str):
+        return ""
+    excerpt = re.sub(r"\s+", " ", answer).strip()
+    if len(excerpt) > _CARD_REPLY_CONTEXT_CHARS:
+        excerpt = excerpt[: _CARD_REPLY_CONTEXT_CHARS - 1].rstrip() + "…"
+    return excerpt
+
+
+def _register_card_reply_context(card_msg_id: str | None, answer: str) -> None:
+    """Remember completed CardKit text independently of live card sessions."""
+    excerpt = _normalize_card_reply_context(answer)
+    if not card_msg_id or not excerpt:
+        return
+    with _card_reply_contexts_lock:
+        _card_reply_contexts[card_msg_id] = excerpt
+        _card_reply_contexts.move_to_end(card_msg_id)
+        while len(_card_reply_contexts) > _CARD_REPLY_CONTEXT_MAX:
+            _card_reply_contexts.popitem(last=False)
+
+
+def _lookup_card_reply_context(card_msg_id: str) -> str | None:
+    with _card_reply_contexts_lock:
+        excerpt = _card_reply_contexts.get(card_msg_id)
+        if excerpt is not None:
+            _card_reply_contexts.move_to_end(card_msg_id)
+        return excerpt
+
+
+def _is_unusable_interactive_fallback(text: Any) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return True
+    normalized = text.strip().casefold()
+    return normalized == "[interactive message]" or "请升级至最新版本客户端，以查看内容" in normalized
+
+
+def _wrap_feishu_adapter_fetch_message_text(orig_fetch: Callable) -> Callable:
+    """Recover CardKit parent text only when Hermes returns its fallback."""
+    async def _intercepted_fetch(self_feishu, message_id: str):
+        text = await orig_fetch(self_feishu, message_id)
+        if not _is_unusable_interactive_fallback(text):
+            return text
+        excerpt = _lookup_card_reply_context(message_id)
+        if excerpt is not None:
+            _logger.debug(
+                "HLS: recovered CardKit reply context msg=%s excerpt_len=%d",
+                (message_id or "?")[:12], len(excerpt),
+            )
+            return excerpt
+        return text
+
+    return _intercepted_fetch
+
+def _wrap_feishu_adapter_dispatch_inbound(orig_dispatch: Callable) -> Callable:
+    """Keep serialized task-chat text messages as distinct queue entries."""
+
+    async def _intercepted_dispatch(self_feishu, event):
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        message_type = getattr(event, "message_type", None)
+        message_type_value = str(getattr(message_type, "value", message_type) or "")
+        is_command = bool(getattr(event, "is_command", lambda: False)())
+
+        if (
+            chat_id
+            and message_type_value == "text"
+            and not is_command
+            and chat_id in _get_config().serialized_chat_ids
+        ):
+            _logger.info(
+                "HLS: serialized chat bypassing Feishu text aggregation "
+                "chat=%s msg=%s",
+                chat_id[:12],
+                str(getattr(event, "message_id", "") or "?")[:12],
+            )
+            return await self_feishu._handle_message_with_guards(event)
+
+        return await orig_dispatch(self_feishu, event)
+
+    return _intercepted_dispatch
+
+
+def _wrap_feishu_adapter_handle_message_with_guards(orig_handle: Callable) -> Callable:
+    """Normalize reply routing before Hermes derives session/delivery metadata.
+
+    Hermes builds the session key and ``_thread_metadata`` before the later
+    ``GatewayRunner._handle_message`` hook runs.  Feishu can populate
+    ``event.source.thread_id`` for an ordinary reply even though the raw event
+    has no real ``thread_id``.  Running the existing normalization here keeps
+    that synthetic value out of both the session key and verified-delivery
+    metadata while preserving genuine topic threads.
+    """
+
+    @functools.wraps(orig_handle)
+    async def _intercepted_handle(self_feishu, event, *args, **kwargs):
+        try:
+            from .hooks import on_feishu_normalize
+
+            source = getattr(event, "source", None)
+            if source is not None:
+                on_feishu_normalize(
+                    message_id=str(getattr(event, "message_id", "") or ""),
+                    source=source,
+                    event=event,
+                    reply_anchor_id=getattr(event, "reply_to_message_id", None),
+                )
+        except Exception:
+            # Routing normalization must never prevent the native adapter from
+            # handling an inbound event.  The verified sender remains the last
+            # line of defence if metadata is still inconsistent.
+            _logger.warning(
+                "HLS: pre-routing Feishu normalization failed",
+                exc_info=True,
+            )
+
+        return await orig_handle(self_feishu, event, *args, **kwargs)
+
+    return _intercepted_handle
 
 def _classify_gateway_message(content: str) -> str:
     """Classify a gateway-internal message by its content for card category."""
@@ -52,6 +281,7 @@ async def _dispatch_feishu_outbound(
     content,
     passthrough: Callable[[], Any],
     *,
+    reply_to: str | None = None,
     metadata: Any = None,
 ):
     """Shared interception for ALL feishu-bound plain-text sends (v1.7.0).
@@ -80,8 +310,75 @@ async def _dispatch_feishu_outbound(
 
     _text_content = content
 
+    # ── Turn lifecycle/status lane ──
+    # Hermes status callbacks (preflight compression, compacting, provider
+    # retry/auth notices, progress) are operational edges of the current turn,
+    # not additional replies.  Publishing them through FeishuAdapter.send used
+    # to create several text bubbles before a first-answer card, and a late
+    # callback could create a second static error card after the answer card.
+    # Keep them owned by the exact HLS session.  ``message_start`` mode already
+    # shows a loading hint inside that one card; final failures are rendered by
+    # the normal completion/error panel or lossless text fallback.
+    _marked_status = bool(
+        isinstance(metadata, dict)
+        and metadata.get(_HLS_STATUS_DELIVERY_KEY)
+    )
+    _compression_status = _is_compression_lifecycle_message(_text_content)
+    _onboarding_notice = _is_home_channel_onboarding_notice(_text_content)
+    if _marked_status or _compression_status or _onboarding_notice:
+        try:
+            from ..controller import get_controller
+
+            _status_ctrl = get_controller()
+            _status_session = (
+                _status_session_for_turn(_status_ctrl, str(chat_id or ""), metadata)
+                if _status_ctrl and _status_ctrl.enabled
+                else None
+            )
+            if _status_session is not None:
+                _logger.info(
+                    "HLS: absorbed turn status into single-card lifecycle "
+                    "msg=%s state=%s kind=%s",
+                    str(getattr(_status_session, "message_id", "") or "?")[:12],
+                    str(getattr(_status_session, "state", "unknown")),
+                    (
+                        str(metadata.get(_HLS_STATUS_KEY) or "lifecycle")
+                        if isinstance(metadata, dict)
+                        else (
+                            "compression"
+                            if _compression_status
+                            else "home_channel_onboarding"
+                        )
+                    ),
+                )
+                return _send_result_ok()
+        except Exception:
+            _logger.debug(
+                "HLS: turn status ownership lookup failed",
+                exc_info=True,
+            )
+
     if getattr(adapter, "_hls_cron_sending", 0) or getattr(adapter, "_hls_bg_sending", 0):
         return await passthrough()
+
+    if _get_config().independent_final_delivery and not _is_cron_delivery_metadata(metadata):
+        # Final delivery also happens after the gateway ContextVar is reset.
+        # A progress card must not suppress that native/verified final send.
+        if _use_verified_delivery(adapter, chat_id, content):
+            from gateway.platforms.base import SendResult
+            from ..feishu.delivery import get_delivery
+            try:
+                sender = get_delivery(adapter)
+                sender.start()
+                return await sender.deliver(chat_id, content, reply_to, metadata)
+            except Exception as exc:
+                _logger.error("HLS verified sender unavailable: %s", type(exc).__name__)
+                return SendResult(success=False, retryable=False,
+                                  error="Final delivery receipt unavailable; no untracked send attempted")
+        result = await passthrough()
+        _logger.info("independent message delivery: len=%d success=%s",
+                     len(content), getattr(result, "success", None))
+        return result
 
     # ── Cron delivery lane (v1.7.0 RELAY fix, P1) ──
     # In relay-fronted deployments _wrap_cron_deliver finds no native
@@ -120,6 +417,35 @@ async def _dispatch_feishu_outbound(
     if ctx is not None:
         eid = ctx.get("event_message_id", "")
         if eid:
+            # An existing card alone is not ownership of this text. In
+            # particular, a second final phase must not be swallowed by the
+            # first phase's card_sent flag.
+            allow_plain = False
+            try:
+                from ..controller import get_controller
+                from ..state.text import strip_reasoning_tags
+                _session = get_controller()._sess_get(eid)
+                if _session is not None:
+                    _final = getattr(_session, "final_answer", "")
+                    if (
+                        _session.state in ("completing", "completed")
+                        and _final and strip_reasoning_tags(content) != _final
+                    ):
+                        allow_plain = True
+                    if _session.state in ("creation_failed", "terminated"):
+                        # Failure must not become a synthetic SendResult(True).
+                        allow_plain = True
+                    if (
+                        chat_id in _get_config().serialized_chat_ids
+                        and _session.state not in ("completing", "completed", "aborted")
+                    ):
+                        allow_plain = True
+            except Exception:
+                _logger.debug("final ownership lookup failed", exc_info=True)
+            if allow_plain:
+                # Transport exceptions must escape; catching them inside the
+                # lookup guard could otherwise turn failure into card_sent OK.
+                return await passthrough()
             # We're inside an agent message pipeline.
             # If card was already sent, suppress the gateway's text reply.
             if ctx.get("card_sent"):
@@ -275,6 +601,7 @@ def _wrap_feishu_adapter_send(orig_send: Callable) -> Callable:
             chat_id,
             content,
             lambda: orig_send(self_feishu, chat_id, content, reply_to=reply_to, metadata=metadata, **kwargs),
+            reply_to=reply_to,
             metadata=metadata,
         )
     return _intercepted_send
@@ -337,6 +664,7 @@ def _wrap_relay_adapter_send(orig_send: Callable) -> Callable:
             chat_id,
             content,
             lambda: orig_send(self_relay, chat_id, content, reply_to=reply_to, metadata=metadata, **kwargs),
+            reply_to=reply_to,
             metadata=metadata,
         )
     return _intercepted_relay_send
@@ -355,9 +683,102 @@ def _wrap_relay_adapter_send_for_platform(orig_sfp: Callable) -> Callable:
             chat_id,
             content,
             lambda: orig_sfp(self_relay, logical_platform, chat_id, content, reply_to=reply_to, metadata=metadata, **kwargs),
+            reply_to=reply_to,
             metadata=metadata,
         )
     return _intercepted_relay_sfp
+
+def _use_verified_delivery(adapter, chat_id, content) -> bool:
+    if not getattr(_get_config(), "verified_final_delivery", False):
+        return False
+    if not isinstance(content, str) or not content.strip() or not str(chat_id).startswith("oc_"):
+        return False
+    if getattr(adapter, "_hls_cron_sending", 0) or getattr(adapter, "_hls_bg_sending", 0):
+        return False
+    from ..feishu.delivery import delivery_context
+    if (delivery_context.get() or {}).get("ephemeral"):
+        return False
+    try:
+        from gateway.platforms.base import EphemeralReply
+        if isinstance(content, EphemeralReply):
+            return False
+    except ImportError:
+        pass
+    return True
+
+
+def _wrap_feishu_delivery_retry(orig: Callable) -> Callable:
+    """The durable sender owns retries. Do not fall through to content[:3500]."""
+    @functools.wraps(orig)
+    async def wrapper(self_feishu, chat_id, content, reply_to=None, metadata=None,
+                      max_retries=2, base_delay=2.0):
+        if _use_verified_delivery(self_feishu, chat_id, content):
+            return await self_feishu.send(chat_id, content, reply_to=reply_to, metadata=metadata)
+        return await orig(self_feishu, chat_id, content, reply_to=reply_to, metadata=metadata,
+                          max_retries=max_retries, base_delay=base_delay)
+    return wrapper
+
+
+def _wrap_feishu_delivery_process(orig: Callable) -> Callable:
+    """Keep the real inbound turn ID even when replies share one topic root."""
+    @functools.wraps(orig)
+    async def wrapper(self_feishu, event, session_key):
+        from ..feishu.delivery import delivery_context
+        text = str(getattr(event, "text", "") or "").lstrip()
+        prefix = getattr(self_feishu, "typed_command_prefix", None) or "!"
+        token = delivery_context.set({
+            "event_ref": str(getattr(event, "message_id", "") or ""),
+            "session_key": session_key,
+            "ephemeral": text.startswith(("/", prefix)),
+        })
+        try:
+            return await orig(self_feishu, event, session_key)
+        finally:
+            delivery_context.reset(token)
+    return wrapper
+
+
+def _wrap_feishu_delivery_connect(orig: Callable) -> Callable:
+    @functools.wraps(orig)
+    async def wrapper(self_feishu, *args, **kwargs):
+        result = await orig(self_feishu, *args, **kwargs)
+        if result and _get_config().verified_final_delivery:
+            from ..feishu.delivery import get_delivery
+            try:
+                get_delivery(self_feishu).start()
+            except Exception as exc:
+                _logger.error("HLS delivery recovery unavailable at connect: %s", type(exc).__name__)
+        return result
+    return wrapper
+
+
+def _wrap_feishu_delivery_disconnect(orig: Callable) -> Callable:
+    @functools.wraps(orig)
+    async def wrapper(self_feishu, *args, **kwargs):
+        sender = getattr(self_feishu, "_hls_verified_delivery", None)
+        try:
+            if sender is not None:
+                await sender.stop()
+        finally:
+            result = await orig(self_feishu, *args, **kwargs)
+        return result
+    return wrapper
+
+
+def _wrap_feishu_native_send_retry(orig: Callable) -> Callable:
+    """Reject a failed chunk before native send() can hide it behind a later ACK."""
+    @functools.wraps(orig)
+    async def wrapper(self_feishu, *args, **kwargs):
+        response = await orig(self_feishu, *args, **kwargs)
+        if _get_config().independent_final_delivery and not self_feishu._response_succeeded(response):
+            from ..feishu.client import FeishuAPIError, _sanitize_message
+            code = getattr(response, "code", 0) or 0
+            detail = _sanitize_message(str(getattr(response, "msg", "no response")))[:300]
+            # Preserve invalid-post wording so native post->text fallback works.
+            raise FeishuAPIError(f"native message part rejected: code={code}, msg={detail}", code=code)
+        return response
+    return wrapper
+
 
 def _register_gateway_card(card_msg_id: str, *, chat_id: str, card_id: str | None, category: str) -> None:
     """Register a gateway card so edit_message can update it later."""

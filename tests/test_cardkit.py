@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from hermes_lark_streaming.cardkit import (
     _LOADING_HINT_ELEMENT_ID,
     _build_error_panel,
@@ -1017,6 +1019,64 @@ class TestBuildUnifiedPanelTrimming:
         assert "已折叠" in first_child.get("content", "")
 
 
+class TestUnifiedPanelHardBudgets:
+    """The production panel builder must be safe before any API write."""
+
+    @staticmethod
+    def _rounds(n: int, text: str = "reasoning") -> list[ReasoningRound]:
+        rounds = [ReasoningRound(index=i + 1, text=text) for i in range(n)]
+        for round_ in rounds:
+            round_.elapsed_ms = 100
+        return rounds
+
+    @staticmethod
+    def _steps(n: int, *, long: bool = False) -> list[dict]:
+        detail = "d" * 5_000 if long else "detail"
+        result = "r" * 10_000 if long else "result"
+        return [
+            {
+                "name": f"tool_{i}",
+                "status": "success",
+                "title": "t" * 1_000 if long else f"Tool {i}",
+                "detail": detail,
+                "result_block": {"content": result, "language": "text"},
+            }
+            for i in range(n)
+        ]
+
+    def test_twenty_rounds_and_tools_fit_real_element_budget(self) -> None:
+        from hermes_lark_streaming.cardkit.elements import _PANEL_ELEMENT_LIMIT
+
+        panel = build_unified_panel(
+            reasoning_rounds=self._rounds(20),
+            tool_steps=self._steps(20),
+            show_reasoning=True,
+            max_reasoning_rounds=20,
+            max_tool_steps=20,
+        )
+
+        assert _count_tag_objects(panel) <= _PANEL_ELEMENT_LIMIT
+        assert "已折叠" in panel["elements"][0].get("content", "")
+
+    def test_long_tool_payloads_fit_wire_budget_and_show_truncation(self) -> None:
+        from hermes_lark_streaming.cardkit.elements import _PANEL_WIRE_BYTES_LIMIT
+
+        panel = build_unified_panel(
+            reasoning_rounds=self._rounds(10, "推理" * 3_000),
+            tool_steps=self._steps(20, long=True),
+            show_reasoning=True,
+            max_reasoning_rounds=20,
+            max_tool_steps=20,
+        )
+        wire_bytes = len(
+            json.dumps(panel, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+
+        assert wire_bytes <= _PANEL_WIRE_BYTES_LIMIT
+        assert "已折叠" in panel["elements"][0].get("content", "")
+        assert "已截断" in json.dumps(panel, ensure_ascii=False)
+
+
 class TestEnforceCardElementLimit:
     """Tests for the card-level element limit safety net."""
 
@@ -1108,6 +1168,13 @@ class TestEnforceCardElementLimit:
             show_reasoning=True,
             max_reasoning_rounds=25,
             max_tool_steps=25,
+        )
+        # build_unified_panel now enforces the production panel budget itself.
+        # Inject extra children so this test still exercises the independent
+        # full-card safety net rather than receiving an already-safe panel.
+        panel["elements"].extend(
+            {"tag": "markdown", "content": f"extra {i}"}
+            for i in range(40)
         )
         elements = [panel, {"tag": "markdown", "content": "Test answer"}, {"tag": "hr"}, {"tag": "markdown", "content": "footer"}]
         card = {

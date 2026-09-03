@@ -1,3 +1,72 @@
+## 1.7.0+moonawn.12 (unreleased fork candidate)
+
+- 修复新 session 首轮没有配置 Feishu home channel 时，Hermes 的可忽略 onboarding 提示绕过 turn ContextVar 并生成第二张 gateway 卡的问题。HLS 现在只对完整固定句式做严格识别，且仅在同一聊天存在唯一活动单卡 turn 时吸收；没有活动 turn、`/sethome` 回执及其他 gateway 消息仍保持可见。
+- 普通 Feishu gateway 中误暴露的评论上下文专用 `feishu_doc` / `feishu_drive` 工具属于 Hermes core 配置边界，本候选配合在部署 Profile 的 `agent.disabled_toolsets` 中禁用；文档评论 Agent 显式启用的原工具不受影响。
+
+## 1.7.0+moonawn.11 (unreleased fork candidate)
+
+- 修复 Hermes 0.21 在 preflight context compression 阶段抛错时，message-start 流式卡已发布但 `_run_agent` completion hook 尚未执行，插件只因“卡片存在”便吞掉 gateway 安全错误文本，导致卡片永久保持加载态。现在会把 gateway 的终态结果写回同一张卡：错误进入 error panel、普通终稿进入 answer，并沿用原有封卡与 ACK 后抑制逻辑。
+- 补充压缩前置失败回归测试；修正 mock E2E 对 `message_start`、单卡交付及 completion timeout 的显式配置，避免 `MagicMock` 将新增布尔配置误判为启用。全套测试覆盖实际单卡形态。
+
+## 1.7.0+moonawn.10 (unreleased fork candidate)
+
+- 修复 Phase 2 已成功创建正文元素并删除 loading hint 后，若新 token 恰在 CardKit API 往返期间到达，Phase 3 会复用上一批 actions、再次删除 `context_loading_hint` 的竞态。现在 Phase 2 ACK 后清空局部 action batch，Phase 3 只提交新变化，避免飞书 `300315 not find elementID` 使整批更新回滚并延迟正文。
+- 新增并发回归测试，模拟 answer stream 期间到达迟发 reasoning，验证第二批更新不含已确认的 Phase 2 操作。
+
+## 1.7.0+moonawn.9 (unreleased fork candidate)
+
+- 修复真实长工具链触发 CardKit `300305 element exceeds the limit`：统一面板不再只按“20 轮/20 步”计数，而是按所有嵌套 `tag` 的真实 element 数限制在 180，并将 panel UTF-8 JSON 限制在 24 KB，为正文、loading 与 footer 预留容量。
+- 按完整推理/工具组裁剪最早过程，避免留下孤立的详情或结果；工具标题、详情与结果分别设显示上限，折叠/截断提示保留中英文，权威正文不参与过程面板裁剪。
+- 将 `300305` 作为永久 payload 错误处理：Phase 2 最多重试一次 answer-only；Phase 3、drain 与 seal 停止重复提交同一超限 panel；最终封卡可再以 answer-only compact seal 完成，避免请求风暴及无谓拆成第二条普通消息。
+- 增加最终 `batch_update` 与 `close_streaming` 成功 ACK 日志，便于 E2E 监控区分“已发请求”和“服务端已确认”。新增真实 element 预算、长 tool payload、Phase 2/3 与封卡恢复回归测试。
+
+## 1.7.0+moonawn.8 (unreleased fork candidate)
+
+- 收紧旧 Hermes 无 status metadata 时的 compression lifecycle 兼容识别：只接受以已知状态图标和固定句式开头的自动状态行，不再全文搜索关键词。
+- 防止解释 `context compression timed out`、`Compacting context` 等内容的正常回答在 CardKit 失败后的普通正文兜底路径中被误判为状态并吞掉；手工 `/compress` feedback 继续可见。
+
+## 1.7.0+moonawn.7 (unreleased fork candidate)
+
+- Hermes gateway status callback 会在 worker thread 创建 coroutine 时携带原始 Feishu turn 标识，避免切换到 gateway loop 后丢失 ContextVar 归属。
+- HLS 已接管的 turn 会吸收 preflight compression、provider retry 和迟到状态 callback；这些状态不再绕过主卡生成多条普通消息，也不会在答案卡完成后追加第二张错误/状态卡。
+- 推荐单卡配置改为 `final_delivery: card` + `streaming_card_start: message_start`：一张卡从准备提示持续到 reasoning/tool、流式正文、权威终稿与封卡。`first_answer` 仍可选，但短回答可能接近瞬时完成。
+- 准备提示改为“正在整理上下文并准备回答…”，并增加 exact-turn、终态迟到 callback、旧 Hermes 无 metadata 兼容及不相关手工状态透传的回归测试。
+
+## 1.7.0+moonawn.6 (unreleased fork candidate)
+
+- Skip gateway monkey patches, Feishu client pre-warm, and message-hook registration when Hermes loads the plugin in its dashboard-only process. This removes a false `gateway.run did not become ready within 60s` error without weakening the gateway process patches.
+
+## 1.7.0+moonawn.5 (unreleased fork candidate)
+
+- 将 `final_delivery: card` 明确为本 fork 推荐展示：reasoning/tool、流式正文与权威终稿在同一 CardKit 内完成，正常路径不再追加常规消息；完整普通消息仅作为 CardKit 建卡、写终稿或封卡失败时的无损兜底。
+- `streaming_card_start: first_answer` 与单卡模式组合时，provider 只有 final、没有 answer delta 也会创建并封定唯一终稿卡；独立答复模式仍跳过没有阅读价值的迟到过程卡。
+- 新增 `examples/single-card-streaming.yaml`，将 split/compact 与 verified delivery 标注为有意分成两条消息的替代模式。
+
+## 1.7.0+moonawn.4 (unreleased fork candidate)
+
+- 新增可选 `streaming_card_start: first_answer`：preflight context compression 期间不创建 CardKit 主流式卡，首段 answer 到达后直接发布带回答元素的卡片，避免“加载上下文”晚闪与长时间暴露。
+- reasoning/tool 事件可在开卡前缓存；answer 既可能来自 `on_answer_delta`，也可能嵌在 thinking callback 中，两条路径都会原子地触发一次开卡。
+- provider 只有 final、压缩期 `/stop`、新消息打断和开卡调度失败均有有界终态，不等待未发生的 `_card_ready`，也不遗留加载卡；完成与创建竞态仍会完成已认领的卡片。
+- 真正收到 CardKit 发布 ACK 后才计入 cards-created 指标。新增配置、竞态、停止和 final-only 回归测试；默认 `message_start` 行为不变。
+
+## 1.7.0+moonawn.3 (unreleased fork candidate)
+
+- CardKit create/reply 的重试链复用 UUID，服务端已接收但 ACK 丢失时不会重复发布加载卡。
+- 紧凑过程卡的完成文案改为“生成完成 · Final answer follows”，避免把生成状态误读成正文送达回执。
+- 补充 preflight compression、长输出、进程中断与可恢复边界说明。
+
+## 1.7.0+moonawn.2 (unreleased fork candidate)
+
+- 在 FeishuAdapter 进入原生 message guard 前归一化引用回复路由，避免普通 reply 的伪 `thread_id` 污染 session key 与最终投递 metadata；保留服务端回读 guard 对错 thread 的 fail-closed 拦截。
+- 对 Hermes 压缩模块增加 feature-detected 兼容保护：仅当本次 `CompressionCommitFence` 已取消时抑制迟到的成功提示，正常 compaction 完成提示不受影响。
+- 新增普通 reply、真实 thread、实际 class patch 安装和压缩 timeout fence 的回归测试。
+
+## 1.7.0+moonawn.1 (unreleased fork candidate)
+
+基于上游 v1.7.0，保留 MIT 与原有署名。新增终稿权威替换、不同 final 阶段交回 gateway、无损分段兜底、每卡单 writer、revision ACK、全局收尾超时和取消清理。合入独立答复、实验性原生发送回读 outbox、启动兼容与可选群队列；新增紧凑过程卡。已移除定时 Gitee 强制同步、自动发布和群通知 workflow，改为固定版本离线 CI。部署边界与候选版本验收见 `MAINTENANCE.md`；尚未声明生产验证。
+
+以下为上游历史记录，测试数字、发布与真飞书验收描述均属于对应上游版本。
+
 ## v1.7.0 (2026-08-26)
 
 全面审计修复版 — 结合 hermes-agent v0.20.5（tag v2026.8.19）最新源码的兼容性审计 + 5 轮插件深度审计（健壮性/性能/Bug/UX/一致性）+ 真飞书 E2E 铁证。本轮共修复 26 项确认问题（P1×8 / P2×14 / P3×4），删除 3 处交叉验证确认的死代码，新增 46 个回归测试（全套件 888 通过 + 集成 26 通过）。

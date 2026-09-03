@@ -127,6 +127,14 @@ class E2ETestRunner:
         cfg.enabled = True
         cfg.linear = True
         cfg.gateway_cards = True
+        # Production single-card mode creates the placeholder at message
+        # start. A bare MagicMock is truthy and would otherwise accidentally
+        # enable first-answer deferral, making start_message wait forever for
+        # a card that the test has not fed an answer to yet.
+        cfg.defer_streaming_card_until_answer = False
+        cfg.compact_progress_card = False
+        cfg.independent_final_delivery = False
+        cfg.card_completion_timeout_sec = 30.0
         cfg.flush_interval_ms = 50  # Fast for tests
         cfg.flush_interval_sec = 0.05
         cfg.card_duration_sec = 600

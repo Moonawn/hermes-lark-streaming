@@ -91,7 +91,14 @@ def _ensure_event_loop_for_sync_tests():
     except RuntimeError:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+    before = asyncio.all_tasks(loop)
     yield
+    if not loop.is_closed() and not loop.is_running():
+        pending = asyncio.all_tasks(loop) - before
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
 
 @pytest.fixture(autouse=True)
@@ -111,6 +118,11 @@ def _cleanup_event_loops():
         if loop.is_closed() or loop.is_running():
             continue
         try:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.run_until_complete(loop.shutdown_asyncgens())
         except Exception:
             pass

@@ -1,242 +1,68 @@
-<h1 align="center">hermes-lark-streaming</h1>
+# Hermes Lark Streaming — Moonawn fork
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Project-Vibe%20Coding-ff69b4" alt="Vibe Coding">
-  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-4caf50.svg" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/python-3.11+-3776AB.svg" alt="Python 3.11+">
-  <img src="https://img.shields.io/badge/version-1.7.0-ff9800.svg" alt="Version">
-</p>
+[中文版](README.zh-CN.md) · [Maintenance and deployment](docs/MAINTENANCE.md) · [MIT license](LICENSE)
 
-<p align="center">
-<a href="mailto:zhengyu.pu@petalmail.com"><img src="https://img.shields.io/badge/Email-zhengyu.pu%40petalmail.com-9C27B0?logo=gmail&logoColor=white" alt="Email"></a>
-<a href="https://applink.feishu.cn/client/message/link/open?token=AmoQJk5dwczIahKlW78ADLU%3D"><img src="https://img.shields.io/badge/The_Only_Official_Group-China-red" alt="The Only Official Group"></a>
-<a href="https://larkcommunity.feishu.cn/wiki/DKkpwgMcJiglIhk88N4cqJEan5f?from=from_copylink"><img src="https://img.shields.io/badge/docs-Knowledge_Base-3370FF?logo=feishu&logoColor=white" alt="Knowledge Base"></a>
-</p>
+An independently maintained fork of [Aowen-Nowor/hermes-lark-streaming](https://github.com/Aowen-Nowor/hermes-lark-streaming), based on upstream **v1.7.0** (`aef71a8`). The upstream project in turn credits [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming). Original attribution and the MIT license are retained.
 
-<p align="center">
-English | <a href="README.zh-CN.md">中文版</a>
-</p>
+**Development candidate: `1.7.0+moonawn.12`. No stable release is implied.** This fork prioritizes complete final answers, bounded streaming cleanup, and a continuous single-card reading experience. It is a Hermes plugin, not a Codex plugin.
 
-Feishu/Lark CardKit v2.0 streaming cards plugin for Hermes Agent — real-time AI response display with typing effect, unified collapsible panel, chronological reasoning/tool display, and more.
+## What changes
 
-> Based on [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming) v0.7.0, with extensive refactoring and optimizations
->
-> ⚠️ **Incompatible with the upstream plugin** — if you have the original `Cheerwhy/hermes-lark-streaming` installed, please uninstall it first before installing this version.
+- The final response replaces streamed progress even when it is shorter. Distinct later final phases are handed back to the gateway instead of being silently discarded.
+- Card creation, updates and sealing share one writer. An old ACK cannot clear a newer answer revision; CardKit publication retries reuse one UUID so an accepted request with a lost ACK does not create a second loading card.
+- Completion has a deadline for every chat. Cancellation releases waiters and ends the session; an orphaned completion does not live forever. A failed card gets a bounded attempt to close its typing animation.
+- Legacy text fallback retains the complete answer, splits it without dropping separators, and reuses per-turn, per-part UUIDs on retry.
+- Recommended **single-card completion** keeps reasoning/tool progress, streamed answer text, and the authoritative final in one CardKit message. A normal turn publishes one card; a lossless plain-message fallback is used only after card delivery fails.
+- Optional **separate final delivery** remains available for deployments that require native-message read-back, but it is no longer this fork's recommended presentation.
+- Optional **compact progress cards** apply only to separate-message delivery; the full answer then stays in another message.
+- Experimental native Feishu **verified delivery** stages the original final and planned payloads in a private SQLite outbox, validates the destination, and reads back every acknowledged message body. It resumes persisted work rather than rerunning the model.
+- Optional per-chat queues retain individual messages and check for withdrawn queued messages. No chat is serialized unless explicitly configured.
+- Feishu reply routing is normalized before Hermes derives the session and delivery metadata: a synthetic `thread_id` on an ordinary reply is removed, while a genuine topic thread is preserved.
+- A feature-detected compression guard suppresses Hermes' late “compaction complete” success message only when that attempt's commit fence was cancelled. Normal completion remains visible.
+- Hermes lifecycle notices are associated with their originating turn and absorbed by that turn's CardKit lifecycle. Preflight compression, provider retry, and late status callbacks no longer create text bubbles or a second status card beside the answer.
+- Optional first-answer activation still delays CardKit creation until answer text exists. It is useful when minimizing placeholder lifetime matters more than showing immediate feedback, but it does not provide the continuous one-card experience recommended by this fork.
 
----
+Upstream v1.7.0's relay support, schema-error recovery, Markdown escape cache and bounded panel history remain in place.
 
-## Effect Preview
+## Choose a display mode
 
-<table align="center">
-  <tr>
-    <td><img src="assets/screenshots/img1.png" width="200px" /></td>
-    <td><img src="assets/screenshots/img2.png" width="200px" /></td>
-    <td><img src="assets/screenshots/img3.png" width="200px" /></td>
-    <td><img src="assets/screenshots/img4.png" width="200px" /></td>
-  </tr>
-</table>
+| Mode | Process card | Final answer | Intended use |
+| --- | --- | --- | --- |
+| Single-card stream (recommended) | Full streamed body and tools | Same card; lossless text fallback if necessary | Continuous reading |
+| Separate + full | Full streamed preview | Independent native message | Keep the typing experience |
+| Separate + compact | Short status and collapsible tools | Independent native message | Long answers and busy groups |
 
----
+The recommended pair is `final_delivery: card` plus `streaming_card_start: message_start`. The CardKit message appears at turn start with one neutral preparation hint, then owns reasoning/tools, streamed answer text, the authoritative final, and completion. Automatic compression and provider lifecycle callbacks are associated with that turn instead of being published as extra messages. A provider that emits only a final still replaces the hint and seals that final in the same card.
 
-## Quick Start
+`streaming_card_start: first_answer` remains available when a deployment prefers no visible placeholder during long preflight work. It buffers reasoning/tools until answer text exists, so a short answer can appear almost complete rather than visibly stream. Lifecycle notices are still absorbed while the turn is owned by HLS.
 
-### Prerequisites
+On the normal single-card path, the gateway reply is suppressed only after CardKit owns completion; create, final-write, or seal failure triggers the full text fallback instead of silently losing the answer. In separate mode, “Final answer follows” describes the next message and is **not** a delivery receipt.
 
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) (running, with Feishu platform configured)
-- Hermes CLI with plugin system support (`hermes plugins` command available)
+Merge [the single-card example](examples/single-card-streaming.yaml) into a **test Profile**, not over an existing configuration. Separate compact progress is an alternative in [the compact example](examples/compact-progress.yaml). Experimental verified delivery is a separate-message opt-in; see [the verified example](examples/verified-native-delivery.yaml) and [its limits](docs/MAINTENANCE.md#verified-delivery).
 
-### Installation
-
-> **💡 Smart Install Prompt**: Copy the following prompt to Hermes Agent, and it will automatically complete the installation:
-> 
-> ```
-> Help me install Feishu Ao-style Cards:
-> - Gitee: https://gitee.com/Aowen-Nowor/hermes-lark-streaming/raw/github_sync/docs/AGENT_GUIDE.md
-> - GitHub: https://raw.githubusercontent.com/Aowen-Nowor/hermes-lark-streaming/github_sync/docs/AGENT_GUIDE.md
-> ```
-
-> The plugin automatically reads the `HERMES_HOME` environment variable to locate the installation path (`~/.hermes` by default). No extra steps are needed for non-default paths.
-
-**Gitee**
-> Choose either SSH or HTTPS:
-```bash
-# Gitee (SSH)
-hermes plugins install git@gitee.com:Aowen-Nowor/hermes-lark-streaming.git
-# Gitee (HTTPS)
-hermes plugins install https://gitee.com/Aowen-Nowor/hermes-lark-streaming
-```
-**GitHub**
-> Choose either SSH or HTTPS:
-```bash
-# GitHub (SSH)
-hermes plugins install git@github.com:Aowen-Nowor/hermes-lark-streaming.git
-# GitHub (HTTPS)
-hermes plugins install https://github.com/Aowen-Nowor/hermes-lark-streaming
-```
-
-Enter `Y` when prompted to enable the plugin, then restart the gateway:
+## Develop and test
 
 ```bash
-hermes gateway restart
+git clone https://github.com/Moonawn/hermes-lark-streaming.git
+cd hermes-lark-streaming
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-test.txt
+python scripts/test_offline.py tests -q
 ```
 
-### Update
+Python 3.11–3.13 is covered by CI. The test runner uses a temporary `HERMES_HOME` and blocks Python socket network calls. Native-adapter tests require a separate, pinned Hermes checkout:
 
 ```bash
-hermes plugins update hermes-lark-streaming
-hermes gateway restart
+HERMES_SRC_DIR=/path/to/hermes-source python scripts/test_offline.py \
+  tests/test_verified_delivery.py tests/test_final_delivery_local.py \
+  tests/test_delivery_reliability.py tests/test_task_group_queue.py tests/integration -q -rs
 ```
 
-### Uninstallation
+When `HERMES_SRC_DIR` is supplied, the native adapter must import successfully; missing dependencies fail the job rather than silently skipping its delivery tests. CI checks fixed Hermes commits, uses read-only repository permissions, and has no Feishu credentials, notifications, releases, deployments or scheduled upstream synchronization.
 
-```bash
-# 1. Clean up injected config (while plugin code is still available)
-# Auto-detect Hermes Python path:
-HERMES_PYTHON=$(python3 ~/.hermes/plugins/hermes-lark-streaming/__main__.py python)
-$HERMES_PYTHON ~/.hermes/plugins/hermes-lark-streaming/__main__.py cleanup
+## Install carefully
 
-# 2. Remove plugin
-hermes plugins uninstall hermes-lark-streaming
+Use a reviewed commit in a new test Profile first. Do not install the upstream and this fork simultaneously. Read the [deployment guide](docs/AGENT_GUIDE.md) before changing a running gateway. The default branch retains the inherited name `github_sync`; it does not automatically synchronize with upstream.
 
-# 3. Restart gateway
-hermes gateway restart
-```
-
-### Verify Installation
-
-```bash
-hermes plugins list
-grep hermes_lark_streaming ~/.hermes/logs/agent.log
-# Auto-detect Hermes Python path:
-HERMES_PYTHON=$(python3 ~/.hermes/plugins/hermes-lark-streaming/__main__.py python)
-$HERMES_PYTHON ~/.hermes/plugins/hermes-lark-streaming/__main__.py status
-$HERMES_PYTHON ~/.hermes/plugins/hermes-lark-streaming/__main__.py verify
-$HERMES_PYTHON ~/.hermes/plugins/hermes-lark-streaming/__main__.py doctor
-```
-
-> **Troubleshooting**: If no card effect appears, check: (1) `hermes plugins list` shows enabled; (2) no `*.bak` directories under `~/.hermes/plugins/`; (3) Feishu credentials are configured. The `doctor` command provides a one-stop diagnostic covering plugin version, Python environment, config, Feishu credentials, patch status, and log paths.
-
----
-
-## Configuration
-
-All settings go under the `hermes_lark_streaming:` section in `~/.hermes/config.yaml`. The plugin auto-injects defaults on first load; run `cleanup` before uninstalling to remove them.
-
-```yaml
-hermes_lark_streaming:
-  panel_expanded: false            # Keep panels expanded in completed cards
-  streaming_panel_expanded: false  # Keep panels expanded during streaming
-  print_strategy: delay            # "fast" (instant) or "delay" (smoother typewriter, default)
-  print_step: 4                    # Typewriter chars per render (default 4, range 1-10, Feishu 7.23+)
-  flush_interval_ms: 200           # Plugin send interval in ms (70-2000, default 200)
-  card_ttl_sec: 600               # Card alive detection timeout (seconds)
-  max_tool_steps: 20               # Max tool steps shown in panel (default 20, range 1–100)
-  max_reasoning_rounds: 20         # Max reasoning rounds shown in panel (default 20, range 1–100)
-
-  footer:
-    show_label: false              # Show field labels
-    fields:
-      - [status, elapsed, model, cost, compression_exhausted]
-      # Available fields:
-      #   status      — Reply status (Completed / Error / Stopped)
-      #   elapsed     — AI response elapsed time
-      #   model       — Model name used
-      #   cost        — Estimated cost with trust indicator ($0.023 est. / $0.023 actual / Free)
-      #   compression_exhausted — Context window is full (⚠ Context Full)
-      # Fields below are not shown by default — add them to the fields list to enable:
-      #   cache       — Cache hit rate (cache_read/total_input hit%)
-      #   tokens      — Token usage (↑ input ↓ output 💭 reasoning)
-      #   context     — Context window usage (used/total percentage)
-      #   api_calls   — Number of API calls in this session
-      #   history_offset — Conversation history offset; larger = longer history, sudden decrease = context compression
-      # Each inner list is one row in the footer; fields only shown when they have values
-```
-
-### Reasoning Panel Display
-
-```yaml
-display:
-  show_reasoning: true  # Show reasoning content in the unified panel
-```
-
-### Unified Panel Overflow Compression
-
-Feishu Card 2.0 has a **hard limit of 200 elements/components** per card. Exceeding it triggers error `300305 (element exceeds the limit)`, which causes card sealing to fail and triggers a plain-text fallback — resulting in duplicate content visible to users.
-
-> **Element counting rule**: Every JSON object with a `tag` property counts as 1 element, including deeply nested ones like `standard_icon`, `plain_text`, `lark_md`, etc.
-
-#### Element Cost Breakdown
-
-| Component | Elements | Notes |
-|-----------|----------|-------|
-| Panel container | 1 | `collapsible_panel` |
-| Panel title | 2 | `plain_text` + `standard_icon` |
-| Each reasoning round (max) | 4 | Title row `div`+`standard_icon`+`lark_md` + reasoning text `markdown` |
-| Each tool step (max) | 7 | Title row `div`+`standard_icon`+`lark_md` + detail row `div`+`plain_text` + result row `div`+`lark_md` |
-| Fold hint (when triggered) | 1 | 1 `markdown` element |
-| Answer text | 1–3 | `markdown`; long text may be split |
-| Footer | 2 | `hr` + `markdown` |
-| Error panel (when present) | ~4 | `collapsible_panel` + inner elements |
-
-**Example calculation**: 20 reasoning rounds + 20 tool steps = 20×4 + 20×7 + fixed overhead ≈ 223 (exceeds 200)
-
-Hence the defaults `max_tool_steps=20` + `max_reasoning_rounds=20`, combined with a fold mechanism, ensure most scenarios stay within limits. Even if a higher config value or an extreme case still exceeds the cap, a built-in **card-level element safety net** kicks in — at seal time all elements are known (panel + answer + footer + error), the actual tag object count is recursively computed, and if it exceeds 195 (200 − 5 buffer), the oldest panel children are trimmed first. This guarantees the card never exceeds 200 elements. Answer, footer, and error panel are never trimmed.
-
-#### Configuration
-
-```yaml
-hermes_lark_streaming:
-  max_tool_steps: 20           # Max tool steps shown in unified panel (default 20, range 1–100)
-  max_reasoning_rounds: 20     # Max reasoning rounds shown in unified panel (default 20, range 1–100)
-```
-
-When the limit is exceeded, early items are collapsed into a single summary line, e.g.: `⚡ 10 early reasoning rounds, 5 early tool steps collapsed`
-
-The panel title always shows the **actual total** (e.g. "3 rounds · 44 tools"); the fold hint only affects what is displayed inside the panel.
-
-### /aowen Commands
-
-Send `/aowen` commands in Feishu, the plugin replies with cards directly (bypassing Hermes AI):
-
-| Command | Description |
-|---------|-------------|
-| `/aowen help` | Show all available commands |
-| `/aowen status` | Show plugin status + current config (collapsible panel) |
-| `/aowen monitor` | Show metrics dashboard (cards created, API calls, error codes, etc.) |
-| `/aowen monitor reset` | Reset metrics counters |
-| `/aowen config reload` | After modifying `~/.hermes/config.yaml`, send this command in Feishu to apply immediately, or restart the gateway |
-| `/aowen` | Same as `/aowen help` |
-
-> `/aowen` is the plugin's command prefix; all `/aowen` commands are handled by the plugin, not Hermes.
-
-### Feishu Credentials
-
-The plugin reuses Hermes's existing Feishu credentials — no separate configuration needed. Hermes already configures these in `~/.hermes/.env` during installation:
-
-```bash
-# ~/.hermes/.env (configured by Hermes, reused by plugin)
-FEISHU_APP_ID=cli_xxxxxx
-FEISHU_APP_SECRET=xxxxxx
-FEISHU_DOMAIN=feishu          # feishu=China, lark=International
-```
-
-> The plugin automatically reads Hermes's Feishu credentials and domain settings. If the Hermes Feishu channel works, the plugin works too.
-
----
-
-## Developer Guide & Changelog
-
-> 📖 **[SKILL.md](docs/SKILL.md)** — LLM quick-start guide. Architecture, key design decisions, efficient code modification guide.
-
-> For the full version history, see [CHANGELOG.md](docs/CHANGELOG.md)
-
-> ⚠️ **Important Notice:** If upgrading from v1.0.1 or below, please follow the uninstallation process to remove the old version and freshly install the new one. Do NOT upgrade via the update command!
-
----
-
-## How to Submit Issues
-> Please refer to the template [ISSUES_TEMPLATE.md](docs/ISSUES_TEMPLATE.md)
-
-## Acknowledgments
-
-<a href="https://github.com/joshcheng820222"><img src="https://avatars.githubusercontent.com/u/26886147?v=4&s=66" alt="joshcheng820222" width="66" height="66"></a> <a href="https://github.com/xuu1998"><img src="https://avatars.githubusercontent.com/u/40609659?v=4&s=66" alt="xuu1998" width="66" height="66"></a> <a href="https://gitee.com/joshchengjoshcheng"><img src="assets/avatars/joshchengjoshcheng.png" alt="joshchengjoshcheng" width="66" height="66"></a> <a href="https://github.com/hmhmdcy"><img src="https://avatars.githubusercontent.com/u/163143682?v=4" alt="hmhmdcy" width="66" height="66"></a>
+Report fork-specific issues and PRs to [Moonawn/hermes-lark-streaming](https://github.com/Moonawn/hermes-lark-streaming/issues). Do not upload real credentials, chat/message IDs, profiles, logs or outbox databases. Upstream documentation under `docs/` is historical unless explicitly marked as fork documentation.

@@ -32,7 +32,7 @@ _T: dict[str, tuple[str, str]] = {
     "bg_review_panel": ("Review", "审查"),
     "partial_continues": ("Continues in next message", "内容未完，继续在下一条消息"),
     # ── Context loading hint (first card only, removed on first token) ──
-    "loading_context": ("Loading context...", "正在加载上下文..."),
+    "loading_context": ("Preparing context and answer...", "正在整理上下文并准备回答..."),
     # ── Clarify interactive card (three-state: pending / submitted / confirmed) ──
     "clarify_select_placeholder": ("Quick select...", "快速选择..."),
     "clarify_input_placeholder": ("Type your answer...", "请输入你的回答..."),
@@ -53,6 +53,10 @@ _T: dict[str, tuple[str, str]] = {
     "collapse_rounds": ("{} rounds of reasoning", "{} 轮早期推理"),
     "collapse_tools": ("{} tool steps", "{} 步早期操作"),
     "collapse_hint_full": ("⚡ Collapsed: {}", "⚡ 还有 {}已折叠"),
+    "collapse_extra": (
+        "; {} more items hidden for card capacity",
+        "；另有 {} 项因卡片容量折叠",
+    ),
     "truncated_suffix": ("\n\n... (truncated, {} chars total)", "\n\n... (已截断，共 {} 字)"),
     # v1.7.0 (R4): known interrupt reasons (core.py error_message) → bilingual
     "interrupt_by_new_message": ("Interrupted by new message", "被新消息中断"),

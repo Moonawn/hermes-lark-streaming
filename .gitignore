@@ -4,6 +4,16 @@ __pycache__/
 dist/
 build/
 .env
+.env.*
+!.env.example
+.venv/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+.test-results/
 *.bak
 .eggs/
 tests/samples/

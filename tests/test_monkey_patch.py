@@ -60,6 +60,28 @@ class TestPatchBasics:
         assert hook_name == "pre_gateway_dispatch", \
             f"Expected pre_gateway_dispatch hook, got: {hook_name}"
 
+    def test_dashboard_registration_skips_runtime_side_effects(self) -> None:
+        """Dashboard-only plugin discovery must not start gateway patch waiters."""
+        from hermes_lark_streaming.plugin import register
+
+        mock_ctx = MagicMock()
+        with (
+            patch("hermes_lark_streaming.plugin.sys.argv", ["hermes", "dashboard", "--no-open"]),
+            patch("hermes_lark_streaming.plugin._ensure_streaming_config"),
+            patch("hermes_lark_streaming.patching.apply_patches") as mock_apply,
+            patch("hermes_lark_streaming.controller.get_controller") as mock_controller,
+            patch("hermes_lark_streaming.plugin._logger") as mock_logger,
+        ):
+            register(mock_ctx)
+
+        mock_apply.assert_not_called()
+        mock_controller.assert_not_called()
+        mock_ctx.register_hook.assert_not_called()
+        assert any(
+            "dashboard process detected" in str(call)
+            for call in mock_logger.info.call_args_list
+        )
+
     def test_monkey_patch_module_imports_version(self) -> None:
         """patching module should import __version__ from the package."""
         from hermes_lark_streaming.patching import __version__ as mp_version
@@ -109,6 +131,36 @@ class TestCronDeliveryWrapper:
 
 class TestMsgCtxCleanup:
     """Verify _msg_ctx is cleared after message processing to prevent leakage."""
+
+    @pytest.mark.asyncio
+    async def test_non_feishu_message_bypasses_streaming_hooks(self) -> None:
+        """A2A and other platforms must never create Feishu card sessions."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from hermes_lark_streaming.patching import (
+            _msg_ctx,
+            _started_msg_ids,
+            _wrap_handle_message_with_agent,
+        )
+
+        orig = AsyncMock(return_value={"final_response": "A2A_OK"})
+        wrapper = _wrap_handle_message_with_agent(orig)
+        runner = MagicMock()
+        event = SimpleNamespace(message_id="task-a2a-probe")
+        source = SimpleNamespace(
+            platform=SimpleNamespace(value="a2a"),
+            chat_id="a2a-context",
+        )
+
+        with patch("hermes_lark_streaming.patching.hooks.on_message_started") as started:
+            result = await wrapper(runner, event, source)
+
+        assert result == {"final_response": "A2A_OK"}
+        orig.assert_awaited_once_with(runner, event, source)
+        started.assert_not_called()
+        assert _msg_ctx.get() is None
+        assert event.message_id not in _started_msg_ids
 
     def test_msg_ctx_cleared_after_wrap_handle_message(self) -> None:
         """After _wrap_handle_message_with_agent completes, _msg_ctx should be None."""

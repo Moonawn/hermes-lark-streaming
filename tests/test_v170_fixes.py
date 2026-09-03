@@ -49,6 +49,8 @@ def _make_session(message_id: str = "msg", chat_id: str = "chat") -> CardSession
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = asyncio.new_event_loop()
+        from tests.test_controller import _loops_to_cleanup
+        _loops_to_cleanup.append(loop)
     return CardSession(message_id, chat_id, loop)
 
 
@@ -307,7 +309,7 @@ class TestTerminalMetadata:
         old.state = STREAMING
         ctrl._sess_put("old", old)
 
-        with patch.object(ctrl, "_complete_session"), patch.object(ctrl, "_fire_and_forget"):
+        with patch.object(ctrl, "_complete_session"), patch.object(ctrl, "_fire_and_forget", side_effect=lambda coro, loop: coro.close()):
             ctrl.on_interrupted(old_message_id="old", new_message_id="new", chat_id="c")
 
         assert old.state == ABORTED
@@ -396,6 +398,7 @@ class TestOnCompletedAbortedSwallow:
         ctrl = _make_ctrl()
         session = _make_session("m4")
         session.state = COMPLETED
+        session.final_answer = "x"  # the duplicate must match a recorded final
         ctrl._sess_put("m4", session)
 
         assert ctrl.on_completed(message_id="m4", answer="x") is True

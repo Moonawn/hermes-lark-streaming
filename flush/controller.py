@@ -27,6 +27,7 @@ class FlushController:
         self._flush_resolvers: list[asyncio.Future[None]] = []
         # （Python 文档："Save a reference to the result of this function"）
         self._pending_flush_tasks: set[asyncio.Task[None]] = set()
+        self._active_flush_task: asyncio.Task | None = None
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -93,7 +94,7 @@ class FlushController:
 
     async def wait_for_flush(self) -> None:
         """等待进行中的 flush 完成."""
-        if not self._flush_in_progress:
+        if self._completed or not self._flush_in_progress:
             return
         future: asyncio.Future[None] = self._get_loop().create_future()
         self._flush_resolvers.append(future)
@@ -102,11 +103,28 @@ class FlushController:
     def mark_completed(self) -> None:
         """标记完成，不再接受新更新."""
         self._completed = True
+        self._needs_reflush = False
         self._cancel_timer()
         for r in self._flush_resolvers:
             if not r.done():
                 r.set_result(None)
         self._flush_resolvers.clear()
+
+    def abort_pending(self) -> None:
+        """Stop timers, release waiters and cancel outstanding transport work."""
+        self.mark_completed()
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        tasks = set(self._pending_flush_tasks)
+        if self._active_flush_task is not None:
+            tasks.add(self._active_flush_task)
+        for task in tasks:
+            if task is current or task.done():
+                continue
+            if not task.get_loop().is_closed():
+                task.get_loop().call_soon_threadsafe(task.cancel)
 
     def set_throttle(self, ms: float) -> None:
         self._throttle_ms = ms
@@ -130,16 +148,21 @@ class FlushController:
         self._get_loop().call_soon(self._create_flush_task, do_flush)
 
     def _create_flush_task(self, do_flush: Callable[[], Awaitable[None]]) -> None:
+        if self._completed:
+            return
         task = self._get_loop().create_task(self._do_flush(do_flush))
         self._pending_flush_tasks.add(task)
         task.add_done_callback(self._pending_flush_tasks.discard)
 
     async def _do_flush(self, do_flush: Callable[[], Awaitable[None]]) -> None:
-        if self._completed or self._flush_in_progress:
+        if self._completed:
+            return
+        if self._flush_in_progress:
             self._needs_reflush = True
             return
 
         self._flush_in_progress = True
+        self._active_flush_task = asyncio.current_task()
         self._needs_reflush = False
         try:
             await do_flush()
@@ -147,6 +170,7 @@ class FlushController:
             _logger.debug("flush error suppressed", exc_info=True)
         finally:
             self._flush_in_progress = False
+            self._active_flush_task = None
             self._last_update_time = time.monotonic()
             # 唤醒等待者
             resolvers = self._flush_resolvers

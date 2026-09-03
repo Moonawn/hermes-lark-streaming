@@ -27,12 +27,14 @@ from ..cardkit import (
 from ..cardkit.i18n import _T, _i18n
 from ..cardkit.md import _downgrade_tables, escape_markdown_asterisks, optimize_markdown_style
 from ..state.linear import UnifiedLinearState
+from ..state.writer import serialized_card_write
 from ..state.text import split_reasoning_text
 from ..feishu import (
     CARDKIT_SCHEMA_ERROR,
     CARDKIT_SEQUENCE_CONFLICT,
     CARDKIT_STREAMING_CLOSED,
     FeishuAPIError,
+    is_element_limit_error,
     is_element_not_found_error,
     is_schema_error,
     is_terminal_api_code,
@@ -57,6 +59,16 @@ if TYPE_CHECKING:
     from ..feishu import FeishuClient
 
 _logger = logging.getLogger("hermes_lark_streaming")
+
+_PANEL_OVERFLOW_SUPPRESSED = "panel_overflow_suppressed"
+
+
+def _suppress_panel_updates(session: Any, state: UnifiedLinearState) -> None:
+    """Stop retrying a permanently rejected process panel for this turn."""
+    session._creation_stages.add(_PANEL_OVERFLOW_SUPPRESSED)
+    state.panel_dirty = False
+    state.tool_steps_dirty = False
+
 
 def _build_seal_summary(state: UnifiedLinearState | None) -> str:
     """Build seal summary from state — answer text or fallback to reasoning."""
@@ -104,6 +116,26 @@ def _answer_fast_stream_sec(cfg: Any) -> float:
     except Exception:
         return 0.150
 
+
+def _card_answer_snapshot(state: UnifiedLinearState, cfg: Any) -> tuple[int, str]:
+    revision, content = state.answer_snapshot()
+    if getattr(cfg, "compact_progress_card", False):
+        content = "✍️ 正在生成答复 · Writing…"
+    return revision, content or " "
+
+
+def _final_card_answer(state: UnifiedLinearState, cfg: Any, *, is_error=False, is_aborted=False) -> str:
+    if getattr(cfg, "compact_progress_card", False):
+        if is_aborted:
+            return "已停止 · Stopped"
+        if is_error:
+            return "处理异常 · Processing error"
+        # This is a generation status, deliberately not a delivery receipt.
+        # Say what happens next so a delayed independent send does not make the
+        # closed progress card look like proof that the final already arrived.
+        return "生成完成 · Final answer follows"
+    return escape_markdown_asterisks(_downgrade_tables(optimize_markdown_style(state.answer_text))) or " "
+
 class UnifiedControllerMixin:
     """Unified panel linear mode — phased card lifecycle."""
 
@@ -115,14 +147,24 @@ class UnifiedControllerMixin:
     _cleanup: Callable[[str], None]
     _flush_deferred_background_reviews: Callable[[CardSession], None]
 
+    @serialized_card_write
     async def _do_create_linear_card(self, session: CardSession) -> None:
-        """Create the initial placeholder card — loading hint only, no panel."""
-        if session.state != IDLE:
-            return
-        # Snapshot epoch before async creation
-        epoch = session.create_epoch
-        session.state = CREATING
-        session._create_epoch_snap = epoch
+        """Create the initial streaming card for the selected start mode."""
+        # Normal callers claim CREATING synchronously before scheduling. Keep
+        # direct invocation compatible for tests and older internal callers.
+        with session._card_activation_lock:
+            if session.state == IDLE:
+                session._card_activation_requested = True
+                session.state = CREATING
+                session._create_epoch_snap = session.create_epoch
+            elif not (
+                session._card_activation_requested
+                and session.state in (CREATING, COMPLETING, ABORTED)
+                and not session.card_id
+                and not session._card_ready.is_set()
+            ):
+                return
+            epoch = session._create_epoch_snap
         session.linear = True
         # v1.4.0 fix (问题3 根因1 — delegate_task 后卡片降级纯文本):
         if session.unified_state is None:
@@ -134,10 +176,18 @@ class UnifiedControllerMixin:
 
             try:
                 reply_to = session.anchor_id or session.message_id
+                first_answer_start = bool(
+                    session.defer_card_until_answer
+                    and session.unified_state is not None
+                    and session.unified_state.answer_text
+                )
                 card = build_streaming_card_v2(
                     include_unified_panel=False,   # Panel added on first token
-                    include_answer_element=False,   # Answer element added with panel
-                    include_loading_hint=True,      # "正在加载上下文..."
+                    # First-answer mode allocates the answer element in the
+                    # initial card, avoiding a misleading late flash of
+                    # "loading context" after compression has ended.
+                    include_answer_element=first_answer_start,
+                    include_loading_hint=not first_answer_start,
                     streaming_panel_expanded=self._cfg.streaming_panel_expanded,
                     print_strategy=self._cfg.print_strategy,
                     print_step=self._cfg.print_step,
@@ -150,12 +200,21 @@ class UnifiedControllerMixin:
                 session.card_created_at = _time.time()
                 session.flush.set_throttle(self._cfg.flush_interval_sec)
 
-                # Track existing elements — only 2 are pre-allocated
-                session.existing_elements = {
-                    _LOADING_HINT_ELEMENT_ID,
-                    _LOADING_ELEMENT_ID,
-                }
+                session.existing_elements = {_LOADING_ELEMENT_ID}
+                if first_answer_start:
+                    session.existing_elements.add(ANSWER_ELEMENT_ID)
+                    session._creation_stages.add("answer")
+                    session._creation_stages.add("hint_removed")
+                else:
+                    session.existing_elements.add(_LOADING_HINT_ELEMENT_ID)
                 session._creation_stages.discard("panel")  # Panel NOT in initial card
+
+                try:
+                    from ..aowen import record_card_created, set_active_sessions
+                    record_card_created()
+                    set_active_sessions(self._sess_active_count())
+                except Exception:
+                    _logger.debug("metrics: record_card_created failed", exc_info=True)
 
             except FeishuAPIError as e:
                 _logger.info("linear CardKit create failed: %s", e)
@@ -202,11 +261,12 @@ class UnifiedControllerMixin:
                     session.guard.terminate("_do_create_linear_card", err=e)
                 except Exception:
                     _logger.debug("guard.terminate failed in create path", exc_info=True)
-            session.state = CREATION_FAILED
-            session.enter_terminal(
-                reason=TerminalReason.CREATION_FAILED,
-                source="_do_create_linear_card",
-            )
+            if not session.is_terminal_phase:
+                session.state = CREATION_FAILED
+                session.enter_terminal(
+                    reason=TerminalReason.CREATION_FAILED,
+                    source="_do_create_linear_card",
+                )
             # Signal readiness even on failure so awaiters don't deadlock
             session._card_ready.set()
 
@@ -249,6 +309,7 @@ class UnifiedControllerMixin:
 
         session.flush.schedule_update(lambda: self._do_unified_flush(session))
 
+    @serialized_card_write
     async def _do_unified_flush(self, session: CardSession) -> None:
         """Unified panel flush — max 2 API calls per flush cycle."""
         if session.is_terminal_phase or session.state == COMPLETING:
@@ -334,7 +395,52 @@ class UnifiedControllerMixin:
                             session._streaming_closed_logged = True
                         session._streaming_closed = True
                         return
-                    if is_schema_error(e):
+                    if is_element_limit_error(e):
+                        # 300305 is permanent for the submitted payload.  The
+                        # old path kept the dirty panel and retried it on every
+                        # flush, producing a request storm while delaying the
+                        # answer.  Retry once without the optional process
+                        # panel, then suppress panel updates for this turn.
+                        _logger.error(
+                            "unified flush phase 2 ELEMENT LIMIT (permanent): %s — "
+                            "retrying answer-only and suppressing panel, card=%s",
+                            e, session.card_id[:12],
+                        )
+                        _suppress_panel_updates(session, state)
+                        answer_only_actions: list[dict[str, Any]] = [{
+                            "action": "add_elements",
+                            "params": {
+                                "type": "insert_before",
+                                "target_element_id": _LOADING_HINT_ELEMENT_ID,
+                                "elements": [_streaming_element(element_id=ANSWER_ELEMENT_ID)],
+                            },
+                        }]
+                        if _LOADING_HINT_ELEMENT_ID in session.existing_elements:
+                            answer_only_actions.append({
+                                "action": "delete_elements",
+                                "params": {"element_ids": [_LOADING_HINT_ELEMENT_ID]},
+                            })
+                        try:
+                            session.sequence += 1
+                            await self._client.cardkit_batch_update(
+                                session.card_id,
+                                answer_only_actions,
+                                sequence=session.sequence,
+                            )
+                        except FeishuAPIError as recovery_error:
+                            _logger.error(
+                                "unified flush phase 2 answer-only recovery failed: %s card=%s",
+                                recovery_error, session.card_id[:12],
+                            )
+                            return
+                        session._creation_stages.update({"answer", "hint_removed"})
+                        session.existing_elements.add(ANSWER_ELEMENT_ID)
+                        session.existing_elements.discard(_LOADING_HINT_ELEMENT_ID)
+                        _logger.info(
+                            "HLS: phase 2 answer-only recovery ACK card=%s seq=%d",
+                            session.card_id[:12], session.sequence,
+                        )
+                    elif is_schema_error(e):
                         _logger.error(
                             "unified flush phase 2 SCHEMA ERROR (permanent): %s — detail: %s card=%s",
                             e, e.extract_schema_detail(), session.card_id[:12],
@@ -408,13 +514,13 @@ class UnifiedControllerMixin:
             # v1.7.0 (R2-01): escaped_answer_view caches the escape incrementally
             # (was: full-text escape on every flush).
             if state.answer_dirty:
-                content = state.escaped_answer_view() or " "
+                revision, content = _card_answer_snapshot(state, self._cfg)
                 session.sequence += 1
                 try:
                     await self._client.cardkit_stream_element(
                         session.card_id, ANSWER_ELEMENT_ID, content, sequence=session.sequence,
                     )
-                    state.answer_dirty = False
+                    state.acknowledge_answer(revision)
                 except FeishuAPIError as e:
                     if e.code == CARDKIT_STREAMING_CLOSED:
                         session._streaming_closed = True
@@ -424,7 +530,20 @@ class UnifiedControllerMixin:
             if not state.panel_dirty and not state.tool_steps_dirty and not state.answer_dirty:
                 return  # Phase 2 done, nothing more to do
 
+            # Phase 2 owns the actions accumulated above (create the answer /
+            # optional panel and remove the loading hint).  New deltas can
+            # arrive while those CardKit calls are in flight and make the
+            # state dirty again before this coroutine reaches Phase 3.  Never
+            # replay the already-ACKed Phase 2 batch in that case: the loading
+            # hint is gone, so replaying its delete makes the whole atomic
+            # Phase 3 batch fail with 300315 and delays the fresh content.
+            actions.clear()
+
         # ── Phase 3: Update existing panel + stream answer ──
+        if _PANEL_OVERFLOW_SUPPRESSED in session._creation_stages:
+            state.panel_dirty = False
+            state.tool_steps_dirty = False
+
         if state.panel_dirty:
             if "panel" in session._creation_stages:
                 # Panel exists — update its content
@@ -514,7 +633,14 @@ class UnifiedControllerMixin:
                         session._streaming_closed_logged = True
                     session._streaming_closed = True
                     return
-                if is_schema_error(e):
+                if is_element_limit_error(e):
+                    _logger.error(
+                        "unified flush phase 3 ELEMENT LIMIT (permanent): %s — "
+                        "suppressing further panel retries, card=%s",
+                        e, session.card_id[:12],
+                    )
+                    _suppress_panel_updates(session, state)
+                elif is_schema_error(e):
                     _logger.error(
                         "unified flush phase 3 SCHEMA ERROR (permanent): %s — "
                         "detail: %s — "
@@ -525,7 +651,7 @@ class UnifiedControllerMixin:
                     state.panel_dirty = False
                     state.tool_steps_dirty = False
                     return
-                if is_element_not_found_error(e):
+                elif is_element_not_found_error(e):
                     # v1.4.1 fix (P1): Phase 3 batch_update 元素不存在 (300315 +
                     # warning 分支 → hint_removed 仍未同步 + existing_elements
                     # 重试。info 级别 (不是 warning/error) — 不是真正的故障。
@@ -538,19 +664,20 @@ class UnifiedControllerMixin:
                     session.existing_elements.discard(_LOADING_HINT_ELEMENT_ID)
                     # 保留 panel_dirty / tool_steps_dirty 以便下轮 flush 重试
                     return
-                _logger.warning("unified flush batch_update failed: %s", e)
-                return
+                elif not is_element_limit_error(e):
+                    _logger.warning("unified flush batch_update failed: %s", e)
+                    return
 
         # Note: skip markdown optimization during streaming for performance;
         if state.answer_dirty and "answer" in session._creation_stages:
             # v1.7.0 (R2-01): incremental escape cache (was full-text escape).
-            content = state.escaped_answer_view() or " "
+            revision, content = _card_answer_snapshot(state, self._cfg)
             session.sequence += 1
             try:
                 await self._client.cardkit_stream_element(
                     session.card_id, ANSWER_ELEMENT_ID, content, sequence=session.sequence,
                 )
-                state.answer_dirty = False
+                state.acknowledge_answer(revision)
             except FeishuAPIError as e:
                 if e.code == CARDKIT_STREAMING_CLOSED:
                     if session._streaming_closed_logged:
@@ -607,6 +734,101 @@ class UnifiedControllerMixin:
         if (reasoning and self._cfg.show_reasoning and not _reasoning_already_tracked) or answer:
             self._schedule_linear_flush(session)
 
+    async def _recover_element_limit_seal(
+        self,
+        session: CardSession,
+        state: UnifiedLinearState | None,
+        *,
+        partial: bool,
+        is_error: bool,
+        is_aborted: bool,
+    ) -> bool:
+        """Seal once with answer-only actions after a permanent 300305."""
+        assert self._client is not None
+        card_id = session.card_id
+        assert card_id is not None
+        if state is not None:
+            _suppress_panel_updates(session, state)
+
+        actions: list[dict[str, Any]] = []
+        if state is not None and state.answer_text and "answer" in session._creation_stages:
+            actions.append({
+                "action": "partial_update_element",
+                "params": {
+                    "element_id": ANSWER_ELEMENT_ID,
+                    "partial_element": {
+                        "content": _final_card_answer(
+                            state,
+                            self._cfg,
+                            is_error=is_error,
+                            is_aborted=is_aborted,
+                        ),
+                    },
+                },
+            })
+        actions.extend(
+            build_preservative_seal_actions(
+                partial=partial,
+                footer_data=None,
+                is_error=False,
+                is_aborted=False,
+                error_message="",
+                footer_fields=[],
+                footer_show_label=False,
+                existing_elements=session.existing_elements,
+                card_trace_id=session.card_trace_id,
+            )
+        )
+
+        try:
+            if actions:
+                session.sequence += 1
+                await self._client.cardkit_batch_update(
+                    card_id, actions, sequence=session.sequence,
+                )
+                session.existing_elements.discard(_LOADING_HINT_ELEMENT_ID)
+                session.existing_elements.discard(_LOADING_ELEMENT_ID)
+                _logger.info(
+                    "HLS: element-limit compact seal batch ACK card=%s seq=%d",
+                    card_id[:12], session.sequence,
+                )
+
+            summary = _build_seal_summary(state)
+            if state is not None and self._cfg.compact_progress_card:
+                summary = _final_card_answer(
+                    state,
+                    self._cfg,
+                    is_error=is_error,
+                    is_aborted=is_aborted,
+                )
+            if not session._streaming_closed:
+                session.sequence += 1
+                await self._client.cardkit_close_streaming(
+                    card_id, sequence=session.sequence, summary=summary,
+                )
+                session._streaming_closed = True
+                _logger.info(
+                    "HLS: element-limit compact close_streaming ACK card=%s seq=%d",
+                    card_id[:12], session.sequence,
+                )
+            elif summary:
+                session.sequence += 1
+                await self._client.cardkit_update_summary(
+                    card_id, summary, sequence=session.sequence,
+                )
+                _logger.info(
+                    "HLS: element-limit compact summary ACK card=%s seq=%d",
+                    card_id[:12], session.sequence,
+                )
+            return True
+        except FeishuAPIError as recovery_error:
+            _logger.error(
+                "HLS: element-limit compact seal failed: %s card=%s",
+                recovery_error, card_id[:12],
+            )
+            return False
+
+    @serialized_card_write
     async def _preservative_seal(
         self,
         session: CardSession,
@@ -628,6 +850,12 @@ class UnifiedControllerMixin:
             # Before closing streaming, we MUST flush any remaining dirty
             # "footer appears before content finishes" bug.
             state = session.unified_state
+            if (
+                state is not None
+                and _PANEL_OVERFLOW_SUPPRESSED in session._creation_stages
+            ):
+                state.panel_dirty = False
+                state.tool_steps_dirty = False
             if state is not None and (state.answer_dirty or state.panel_dirty or state.tool_steps_dirty):
                 _logger.warning(
                     "preservative seal: dirty data detected at seal time "
@@ -637,7 +865,11 @@ class UnifiedControllerMixin:
                     card_id[:12],
                 )
                 # ── Flush remaining panel content ──
-                if (state.panel_dirty or state.tool_steps_dirty) and "panel" in session._creation_stages:
+                if (
+                    (state.panel_dirty or state.tool_steps_dirty)
+                    and "panel" in session._creation_stages
+                    and _PANEL_OVERFLOW_SUPPRESSED not in session._creation_stages
+                ):
                     all_tool_steps = session.tool_use.build_display_steps()
                     panel = build_unified_panel(
                         reasoning_rounds=state.reasoning_rounds,
@@ -672,6 +904,13 @@ class UnifiedControllerMixin:
                         if e.code == CARDKIT_STREAMING_CLOSED:
                             _logger.info("seal drain: streaming already closed, skipping panel flush")
                             session._streaming_closed = True
+                        elif is_element_limit_error(e):
+                            _logger.error(
+                                "seal drain ELEMENT LIMIT (permanent): %s — "
+                                "suppressing panel, card=%s",
+                                e, card_id[:12],
+                            )
+                            _suppress_panel_updates(session, state)
                         else:
                             _logger.warning("seal drain panel failed: %s", e)
                         state.panel_dirty = False
@@ -680,7 +919,7 @@ class UnifiedControllerMixin:
                 # ── Flush remaining answer text ──
                 if state.answer_dirty and "answer" in session._creation_stages and not session._streaming_closed:
                     # v1.7.0 (R2-01): incremental escape cache (was full-text escape).
-                    content = state.escaped_answer_view() or " "
+                    revision, content = _card_answer_snapshot(state, self._cfg)
                     try:
                         session.sequence += 1
                         _logger.info(
@@ -691,7 +930,7 @@ class UnifiedControllerMixin:
                             session.card_id, ANSWER_ELEMENT_ID, content,
                             sequence=session.sequence,
                         )
-                        state.answer_dirty = False
+                        state.acknowledge_answer(revision)
                     except FeishuAPIError as e:
                         # v1.1.1: 统一 fallback — 300309 和 300313 都改用 batch_update（不带 tag）
                         if e.code == CARDKIT_STREAMING_CLOSED or is_element_not_found_error(e):
@@ -703,13 +942,14 @@ class UnifiedControllerMixin:
                                 card_id[:12],
                             )
                             session.sequence += 1
-                            await _fallback_write_answer(
+                            answer_ok = await _fallback_write_answer(
                                 self._client, session.card_id, content,
                                 sequence=session.sequence,
                             )
+                            if answer_ok:
+                                state.acknowledge_answer(revision)
                         else:
                             _logger.warning("HLS: seal drain answer failed: %s", e)
-                        state.answer_dirty = False
 
             # ── Step 1: Update unified panel to final state (non-streaming) ──
             seal_actions: list[dict[str, Any]] = []
@@ -719,7 +959,10 @@ class UnifiedControllerMixin:
                 state.finalize()
 
                 # ── Bug fix (v1.0.5): Only update panel if it was created ──
-                if "panel" in session._creation_stages:
+                if (
+                    "panel" in session._creation_stages
+                    and _PANEL_OVERFLOW_SUPPRESSED not in session._creation_stages
+                ):
                     all_tool_steps = session.tool_use.build_display_steps()
                     panel = build_unified_panel(
                         reasoning_rounds=state.reasoning_rounds,
@@ -746,7 +989,7 @@ class UnifiedControllerMixin:
             # v1.3.1 fix: Do NOT skip this step even when the answer was already fully
             # guard) is a minor visual issue; content truncation is a P0 data-loss bug.
             if state is not None and state.answer_text and "answer" in session._creation_stages:
-                optimized_content = escape_markdown_asterisks(_downgrade_tables(optimize_markdown_style(state.answer_text))) or " "
+                optimized_content = _final_card_answer(state, self._cfg, is_error=is_error, is_aborted=is_aborted)
                 seal_actions.append({
                     "action": "partial_update_element",
                     "params": {
@@ -874,12 +1117,20 @@ class UnifiedControllerMixin:
                 await self._client.cardkit_batch_update(
                     card_id, seal_actions, sequence=session.sequence,
                 )
+                session.existing_elements.discard(_LOADING_HINT_ELEMENT_ID)
+                session.existing_elements.discard(_LOADING_ELEMENT_ID)
+                _logger.info(
+                    "HLS: preservative seal final batch ACK card=%s seq=%d",
+                    card_id[:12], session.sequence,
+                )
 
             # When closing streaming, we MUST also update the card's summary
             # bug the user reported.
             # CRITICAL: Only call close_streaming ONCE per card lifecycle.
             # updated to config.summary.content.  The summary MUST be
             seal_summary = _build_seal_summary(state)
+            if state is not None and self._cfg.compact_progress_card:
+                seal_summary = _final_card_answer(state, self._cfg, is_error=is_error, is_aborted=is_aborted)
 
             if not session._streaming_closed:
                 session.sequence += 1
@@ -894,6 +1145,10 @@ class UnifiedControllerMixin:
                     card_id, sequence=session.sequence, summary=seal_summary,
                 )
                 session._streaming_closed = True
+                _logger.info(
+                    "HLS: preservative seal close_streaming ACK card=%s trace=%s seq=%d",
+                    card_id[:12], session.card_trace_id, session.sequence,
+                )
             else:
                 _logger.info(
                     "preservative seal: streaming already closed, skipping close_streaming card=%s",
@@ -921,6 +1176,19 @@ class UnifiedControllerMixin:
             return True
 
         except FeishuAPIError as e:
+            if is_element_limit_error(e):
+                _logger.error(
+                    "preservative seal ELEMENT LIMIT (permanent): %s — "
+                    "retrying once without process panel/footer, card=%s",
+                    e, card_id[:12],
+                )
+                return await self._recover_element_limit_seal(
+                    session,
+                    state,
+                    partial=partial,
+                    is_error=is_error,
+                    is_aborted=is_aborted,
+                )
             if e.code == CARDKIT_SEQUENCE_CONFLICT:
                 _logger.warning(
                     "preservative seal: sequence conflict, retrying... card=%s seq=%d",
@@ -931,7 +1199,10 @@ class UnifiedControllerMixin:
                         retry_actions: list[dict[str, Any]] = []
                         if state is not None:
                             # ── Bug fix (v1.0.5): Only update panel if it was created ──
-                            if "panel" in session._creation_stages:
+                            if (
+                                "panel" in session._creation_stages
+                                and _PANEL_OVERFLOW_SUPPRESSED not in session._creation_stages
+                            ):
                                 all_tool_steps = session.tool_use.build_display_steps()
                                 retry_panel = build_unified_panel(
                                     reasoning_rounds=state.reasoning_rounds,
@@ -957,7 +1228,7 @@ class UnifiedControllerMixin:
                             # v1.3.1: same fix as main seal path — always send final
                             # (see v1.3.1 fix comment in main seal path above).
                             if state.answer_text and "answer" in session._creation_stages:
-                                optimized_content = escape_markdown_asterisks(_downgrade_tables(optimize_markdown_style(state.answer_text))) or " "
+                                optimized_content = _final_card_answer(state, self._cfg, is_error=is_error, is_aborted=is_aborted)
                                 retry_actions.append({
                                     "action": "partial_update_element",
                                     "params": {
@@ -991,6 +1262,8 @@ class UnifiedControllerMixin:
                         if not session._streaming_closed:
                             # Recompute seal_summary for retry (state may have changed)
                             retry_summary = _build_seal_summary(state)
+                            if state is not None and self._cfg.compact_progress_card:
+                                retry_summary = _final_card_answer(state, self._cfg, is_error=is_error, is_aborted=is_aborted)
                             session.sequence += 1
                             await self._client.cardkit_close_streaming(
                                 card_id, sequence=session.sequence, summary=retry_summary,
@@ -1040,9 +1313,27 @@ class UnifiedControllerMixin:
         # ── Step 1: Wait for any in-progress flush to finish ──
         await session.flush.wait_for_flush()
 
+        # Creation also uses the writer. Wait outside the lock or a quick final
+        # can deadlock behind the very creation whose readiness it is awaiting.
+        if not session.card_id and not session._card_ready.is_set():
+            await session._card_ready.wait()
+        async with session.writer.writing():
+            return await self._finish_linear_card(session)
+
+    async def _finish_linear_card(self, session: CardSession) -> bool:
+        """Drain and seal while holding the same writer as create and flush."""
+        if session.guard.should_skip("_finish_linear_card"):
+            return False
+
         # without being flushed.  We must drain it ALL here, before
         # the "footer appears before content finishes" bug.
         state = session.unified_state
+        if (
+            state is not None
+            and _PANEL_OVERFLOW_SUPPRESSED in session._creation_stages
+        ):
+            state.panel_dirty = False
+            state.tool_steps_dirty = False
         _MAX_DRAIN_ROUNDS = 8
         _DRAIN_YIELD_SEC = 0.020  # 20ms yield — enough for worker thread callbacks
         for _drain_round in range(_MAX_DRAIN_ROUNDS):
@@ -1064,7 +1355,11 @@ class UnifiedControllerMixin:
             assert self._client is not None
 
             # ── Drain panel content ──
-            if state.panel_dirty and "panel" in session._creation_stages:
+            if (
+                state.panel_dirty
+                and "panel" in session._creation_stages
+                and _PANEL_OVERFLOW_SUPPRESSED not in session._creation_stages
+            ):
                 all_tool_steps = session.tool_use.build_display_steps()
                 panel = build_unified_panel(
                     reasoning_rounds=state.reasoning_rounds,
@@ -1103,6 +1398,13 @@ class UnifiedControllerMixin:
                             _logger.info("drain: streaming already closed, skipping")
                             session._streaming_closed_logged = True
                         session._streaming_closed = True
+                    elif is_element_limit_error(e):
+                        _logger.error(
+                            "drain ELEMENT LIMIT (permanent): %s — "
+                            "suppressing panel retries, card=%s",
+                            e, session.card_id[:12],
+                        )
+                        _suppress_panel_updates(session, state)
                     elif is_schema_error(e):
                         _logger.error("drain SCHEMA ERROR: %s — detail: %s", e, e.extract_schema_detail())
                         state.panel_dirty = False
@@ -1113,7 +1415,7 @@ class UnifiedControllerMixin:
             # ── Drain answer text ──
             if state.answer_dirty and "answer" in session._creation_stages:
                 # v1.7.0 (R2-01): incremental escape cache (was full-text escape).
-                content = state.escaped_answer_view() or " "
+                revision, content = _card_answer_snapshot(state, self._cfg)
                 try:
                     session.sequence += 1
                     _logger.info(
@@ -1124,7 +1426,7 @@ class UnifiedControllerMixin:
                         session.card_id, ANSWER_ELEMENT_ID, content,
                         sequence=session.sequence,
                     )
-                    state.answer_dirty = False
+                    state.acknowledge_answer(revision)
                 except FeishuAPIError as e:
                     # v1.1.1: 统一 fallback — 300309 和 300313 都改用 batch_update（不带 tag）
                     # 之前 300309 直接 skip 答案丢失；300313 的 fallback 带 tag 报 300312
@@ -1148,7 +1450,7 @@ class UnifiedControllerMixin:
                             sequence=session.sequence,
                         )
                         if ok:
-                            state.answer_dirty = False
+                            state.acknowledge_answer(revision)
                     else:
                         _logger.warning("HLS: drain answer failed: %s", e)
 
@@ -1176,11 +1478,6 @@ class UnifiedControllerMixin:
 
         # ── Step 3: Mark flush as completed — no more updates accepted ──
         session.flush.mark_completed()
-
-        try:
-            await asyncio.wait_for(session._card_ready.wait(), timeout=30.0)
-        except asyncio.TimeoutError:
-            _logger.warning("complete: card creation timed out: msg=%s", (session.message_id or "?")[:12])
 
         if not session.card_id:
             session.state = CREATION_FAILED
@@ -1221,6 +1518,18 @@ class UnifiedControllerMixin:
         )
 
         if seal_ok:
+            # A sealed loading-only card is not a delivered answer. In legacy
+            # mode wait for the lossless fallback ACK before recording success;
+            # separate-message mode leaves this exclusively to the gateway.
+            if (
+                state is not None
+                and state.answer_text
+                and "answer" not in session._creation_stages
+                and not self._cfg.independent_final_delivery
+            ):
+                _logger.warning("answer element missing; using full text fallback msg=%s", (session.message_id or "?")[:12])
+                if not await self._send_text_fallback(session, fallback_text=state.answer_text):
+                    return False
             # v1.3.4 fix (P1): 如果会话已被 on_aborted 标记为 ABORTED，
             if session._was_aborted:
                 session.state = ABORTED
@@ -1237,37 +1546,18 @@ class UnifiedControllerMixin:
                     reason=TerminalReason.NORMAL,
                     source="_do_linear_complete",
                 )
-            # v1.7.0 (R1-03): if the answer element was never created (Phase 2
-            # SCHEMA ERROR mid-stream), the card shows no answer at all —
-            # snapshot the text BEFORE releasing state and deliver it as a
-            # plain text reply so the user still gets the response.
-            _lost_answer = ""
-            if (
-                state is not None
-                and state.answer_text
-                and "answer" not in session._creation_stages
-            ):
-                _lost_answer = state.answer_text
+                if session.card_msg_id and session.unified_state is not None:
+                    from ..patching.adapter import _register_card_reply_context
+                    _register_card_reply_context(
+                        session.card_msg_id,
+                        session.final_answer or session.unified_state.answer_text,
+                    )
             # v1.1.1: 释放重数据（unified_state/text/tool_use），减少内存占用
             # session 留最小元数据等 _prune_stale_sessions 清理
             try:
                 self._release_session_data(session)
             except Exception:
                 _logger.debug("HLS: release session data failed", exc_info=True)
-            if _lost_answer:
-                _logger.warning(
-                    "linear complete: answer element never created (schema "
-                    "error?) — delivering answer via text fallback msg=%s len=%d",
-                    (session.message_id or "?")[:12], len(_lost_answer),
-                )
-                try:
-                    await self._send_text_fallback(session, fallback_text=_lost_answer)
-                except Exception:
-                    _logger.warning(
-                        "linear complete: lost-answer text fallback failed msg=%s",
-                        (session.message_id or "?")[:12],
-                        exc_info=True,
-                    )
             # v1.1.0: Record metrics
             try:
                 from ..aowen import record_card_completed

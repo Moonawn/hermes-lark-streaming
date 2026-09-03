@@ -113,6 +113,45 @@ class Config:
         return _to_bool(sec.get("linear", True), default=True)
 
     @property
+    def independent_final_delivery(self) -> bool:
+        """Opt-in safety mode: the native gateway owns final text and its ACK.
+
+        A streaming card is progress UI, not proof of final delivery. Keep the
+        legacy default for other installations; enable per Profile explicitly.
+        """
+        return self._plugin_sec().get("final_delivery") == "separate_message"
+
+    @property
+    def verified_final_delivery(self) -> bool:
+        """Explicit opt-in; never run alongside Hermes's generic redeliverer."""
+        if not self.independent_final_delivery or not _to_bool(
+            self._plugin_sec().get("verified_delivery", False)
+        ):
+            return False
+        gateway = (self._raw or {}).get("gateway") or {}
+        return not _to_bool(gateway.get("delivery_ledger", True), default=True)
+
+    @property
+    def compact_progress_card(self) -> bool:
+        """Status and tools only; allowed only when final text has its own send."""
+        return self.independent_final_delivery and self._plugin_sec().get("progress_card") == "compact"
+
+    @property
+    def defer_streaming_card_until_answer(self) -> bool:
+        """Create the CardKit streaming card only when answer text exists.
+
+        Hermes may spend minutes in preflight context compression before the
+        model can produce an answer. Keeping that phase outside a long-lived
+        streaming card avoids loading-only cards that can be stranded by a
+        restart or interruption. The legacy message-start behavior stays the
+        default for compatibility.
+        """
+        value = str(
+            self._plugin_sec().get("streaming_card_start", "message_start")
+        ).strip().lower()
+        return value == "first_answer"
+
+    @property
     def panel_expanded(self) -> bool:
         sec = self._plugin_sec()
         return _to_bool(sec.get("panel_expanded", False))
@@ -203,6 +242,43 @@ class Config:
     @property
     def card_duration_sec(self) -> int:
         return _to_int(self._plugin_sec().get("card_ttl_sec", 600), default=600)
+
+    @property
+    def serialized_chat_ids(self) -> frozenset[str]:
+        """Chats whose agent turns must run one at a time across all senders."""
+        queue = self._plugin_sec().get("queue", {})
+        if not isinstance(queue, dict):
+            return frozenset()
+        values = queue.get("serialized_chat_ids", [])
+        if not isinstance(values, (list, tuple, set, frozenset)):
+            return frozenset()
+        return frozenset(str(value).strip() for value in values if str(value).strip())
+
+    @property
+    def delivery_wait_timeout_sec(self) -> float:
+        """Maximum time a serialized chat waits for card seal or fallback."""
+        queue = self._plugin_sec().get("queue", {})
+        if not isinstance(queue, dict):
+            return 12.0
+        timeout = _to_float(queue.get("delivery_wait_timeout_sec", 12), default=12.0)
+        return max(2.0, min(30.0, timeout))
+
+    @property
+    def card_completion_timeout_sec(self) -> float:
+        """Bound completion for every chat; keep the legacy queue alias."""
+        sec = self._plugin_sec()
+        queue = sec.get("queue", {})
+        legacy = queue.get("card_completion_timeout_sec", 10) if isinstance(queue, dict) else 10
+        timeout = _to_float(sec.get("card_completion_timeout_sec", legacy), default=10.0)
+        return max(2.0, min(25.0, timeout))
+
+    @property
+    def verify_waiting_message_available(self) -> bool:
+        """Recheck a queued Feishu message before dispatching it to the model."""
+        queue = self._plugin_sec().get("queue", {})
+        if not isinstance(queue, dict):
+            return True
+        return _to_bool(queue.get("verify_waiting_message_available", True), default=True)
 
     @property
     def footer_fields(self) -> list[list[str]]:
